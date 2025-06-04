@@ -1,0 +1,18 @@
+[package]
+name = "async-deferred"
+version = "0.1.0"
+edition = "2021"
+authors = ["Azy"]
+description = "A lightweight utility for spawning async tasks with fire-and-forget semantics and deferred result retrieval."
+license = "MIT"
+repository = "https://github.com/I-Azy-I/async-deferred"
+readme = "README.md"
+categories = ["asynchronous", "concurrency", "data-structures"]
+keywords = ["async", "deferred", "task", "concurrency", "utility", "tokio"]
+documentation = "https://docs.rs/async-deferred"
+homepage = "https://github.com/I-Azy-I/async-deferred"
+
+[dependencies]
+tokio = { version = "1.45", features = ["rt-multi-thread", "rt", "macros", "sync"]}
+[dev-dependencies]
+tokio-test = "0.4"
