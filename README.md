@@ -10,33 +10,7 @@ A lightweight utility for fire-and-forget async computations in Rust. Start asyn
 - **Callback support**: Execute cleanup or notification code after task completion
 
 
-## Basic Usage
-
-```rust
-use async_deferred::Deferred;
-use std::time::Duration;
-use tokio::time::sleep;
-
-#[tokio::main]
-async fn main() {
-    // Start a computation immediately
-    let mut deferred = Deferred::start(|| async {
-        println!("Starting async work...");
-        sleep(Duration::from_secs(2)).await;
-        42 // Return result
-    });
-
-    // Do other work while computation runs
-    println!("Doing other work...");
-    sleep(Duration::from_millis(500)).await;
-
-    // Get the result when ready
-    let result = deferred.join().await.try_get();
-    println!("Result: {:?}", result); // Result: Some(42)
-}
-```
-
-## Advanced Examples
+## Examples
 
 ### Non-blocking Result Checking
 
@@ -79,28 +53,29 @@ async fn main() {
 }
 ```
 
-### Manual Task Management
+### Await for a result
 
 ```rust
 use async_deferred::Deferred;
+use std::time::Duration;
+use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() {
-    let mut deferred = Deferred::new();
-    
-    // Start when ready
-    deferred.begin(|| async {
-        // Your async work here
-        process_data().await
+    // Start a computation immediately
+    let mut deferred = Deferred::start(|| async {
+        println!("Starting async work...");
+        sleep(Duration::from_secs(2)).await;
+        42 // Return result
     });
 
-    // Check state
-    match deferred.state() {
-        State::Pending => println!("Task running..."),
-        State::Completed => println!("Task done!"),
-        State::TaskPanicked(msg) => println!("Task failed: {}", msg),
-        _ => {}
-    }
+    // Do other work while computation runs
+    println!("Doing other work...");
+    sleep(Duration::from_millis(500)).await;
+
+    // Get the result when ready
+    let result = deferred.join().await.try_get();
+    println!("Result: {:?}", result); // Result: Some(42)
 }
 ```
 
