@@ -8,7 +8,7 @@ license = "MIT"
 repository = "https://github.com/I-Azy-I/async-deferred"
 readme = "README.md"
 categories = ["asynchronous", "concurrency", "data-structures"]
-keywords = ["async", "deferred", "task", "concurrency", "utility", "tokio"]
+keywords = ["async", "deferred", "task", "utility", "tokio"]
 documentation = "https://docs.rs/async-deferred"
 homepage = "https://github.com/I-Azy-I/async-deferred"
 
