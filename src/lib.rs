@@ -520,6 +520,85 @@ where
         self
     }
 
+    /// Cancels the current task if it's pending.
+    /// 
+    /// If the task is not pending (completed, panicked, or not initialized), 
+    /// this method does nothing and returns `false`. Returns `true` if the 
+    /// task was successfully cancelled.
+    ///
+    /// After cancellation, the `Deferred` returns to the `NotInitialized` state
+    /// and can be reused with a new task via `begin()` or `begin_with_callback()`.
+    /// 
+    /// # Returns
+    /// - `true` if a pending task was cancelled
+    /// - `false` if there was no pending task to cancel
+    /// 
+    /// # Examples
+    /// 
+    /// ```rust
+    /// use async_deferred::{Deferred, State};
+    /// 
+    /// # tokio_test::block_on(async {
+    /// let mut deferred = Deferred::start(|| async { 
+    ///     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+    ///     42 
+    /// });
+    /// 
+    /// let was_cancelled = deferred.cancel();
+    /// assert!(was_cancelled);
+    /// assert_eq!(deferred.state(), State::NotInitialized);
+    /// 
+    /// // Can reuse the deferred after cancellation
+    /// deferred.begin(|| async { 100 });
+    /// assert!(deferred.is_pending());
+    /// # })
+    /// ```
+    /// 
+    /// ```rust
+    /// use async_deferred::{Deferred, State};
+    /// 
+    /// # tokio_test::block_on(async {
+    /// // Task completes quickly
+    /// let mut deferred = Deferred::start(|| async { 42 });
+    /// tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    /// 
+    /// // Try to cancel after completion - does nothing
+    /// let was_cancelled = deferred.cancel();
+    /// assert!(!was_cancelled);
+    /// assert_eq!(deferred.state(), State::Completed);
+    /// assert_eq!(deferred.take(), Some(42));
+    /// # })
+    /// ```
+    /// 
+    /// ```rust
+    /// use async_deferred::{Deferred, State};
+    /// 
+    /// # tokio_test::block_on(async {
+    /// // Not initialized yet
+    /// let mut deferred: Deferred<i32> = Deferred::new();
+    /// 
+    /// // Try to cancel uninitialized task - does nothing
+    /// let was_cancelled = deferred.cancel();
+    /// assert!(!was_cancelled);
+    /// assert_eq!(deferred.state(), State::NotInitialized);
+    /// # })
+    /// ```
+    pub fn cancel(&mut self) -> bool{
+        if self.is_pending() {
+        if let Some(handle) = &self.task_handle {
+            handle.abort();
+        }
+        // Reset to uninitialized state
+        self.task_handle = None;
+        self.value = Arc::new(OnceCell::new());
+        self.panic_message = None;
+        self.is_callback_panic = false;
+        true
+    } else {
+        false
+    }
+    }
+
     /// Attempts to take ownership of the computed value.
     ///
     /// Returns `Some(T)` if the task has completed successfully, consuming the stored result.
