@@ -1,6 +1,6 @@
 [package]
 name = "async-deferred"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Azy"]
 description = "A lightweight utility for spawning async tasks with fire-and-forget semantics and deferred result retrieval."
