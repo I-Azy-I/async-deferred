@@ -13,6 +13,6 @@ documentation = "https://docs.rs/async-deferred"
 homepage = "https://github.com/I-Azy-I/async-deferred"
 
 [dependencies]
-tokio = { version = "1.45", features = ["rt-multi-thread", "rt", "macros", "sync"]}
+tokio = { version = "1.*", features = ["rt-multi-thread", "rt", "macros", "sync"]}
 [dev-dependencies]
 tokio-test = "0.4"
