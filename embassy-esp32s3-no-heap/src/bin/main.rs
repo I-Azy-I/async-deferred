@@ -90,8 +90,12 @@ async fn main(spawner: Spawner) -> ! {
             info!("#{}: {} °C after {} ms", n, value, started.elapsed().as_millis());
         } else if started.elapsed() > MEASUREMENT_TIMEOUT {
             // Wait until the hung task has stopped, so its task slot is free again.
-            MEASUREMENT.cancel_and_wait().await;
-            warn!("#{}: no answer after {} ms, cancelled", n, started.elapsed().as_millis());
+            if MEASUREMENT.cancel_and_wait().await {
+                warn!("#{}: no answer after {} ms, cancelled", n, started.elapsed().as_millis());
+            } else {
+                // Starting it failed, so nothing was running: just try the next one.
+                warn!("#{}: was not running", n);
+            }
         } else {
             continue;
         }
