@@ -519,27 +519,18 @@ fn join_after_take_then_a_later_run_is_cancelled() {
 #[test]
 fn join_after_the_ticket_is_dropped() {
     let mut cx = Context::from_waker(noop_waker_ref());
-
-    let deferred = StaticDeferred::<u32>::new();
-    let ticket = deferred.begin().unwrap();
-    let mut join = std::pin::pin!(deferred.join());
-    assert!(join.as_mut().poll(&mut cx).is_pending());
-    drop(ticket);
-    assert_eq!(
-        join.as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::Cancelled))
-    );
-
-    let deferred = StaticDeferred::<u32>::new();
-    let ticket = deferred.begin().unwrap();
-    let mut join = std::pin::pin!(deferred.join());
-    assert!(join.as_mut().poll(&mut cx).is_pending());
-    drop(ticket);
-    let _next = deferred.begin().unwrap();
-    assert_eq!(
-        join.as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::Cancelled))
-    );
+    for begin_again in [false, true] {
+        let deferred = StaticDeferred::<u32>::new();
+        let ticket = deferred.begin().unwrap();
+        let mut join = std::pin::pin!(deferred.join());
+        assert!(join.as_mut().poll(&mut cx).is_pending());
+        drop(ticket);
+        let _next = begin_again.then(|| deferred.begin().unwrap());
+        assert_eq!(
+            join.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Cancelled))
+        );
+    }
 }
 
 static REENTRANT: StaticDeferred<u32> = StaticDeferred::new();

@@ -150,6 +150,13 @@ impl<T> Shared<T> {
         }
     }
 
+    /// Ends the current run without a result and resets to `NotStarted`. The new run number
+    /// tells the task and any waiting `join` that this run ended.
+    fn end_run(&mut self) {
+        self.phase = Phase::NotStarted;
+        self.run = self.run.wrapping_add(1);
+    }
+
     fn take_waiter(&mut self) -> Option<Waker> {
         self.waiter.take().map(|waiter| waiter.waker)
     }
@@ -305,10 +312,10 @@ impl<T> StaticDeferred<T> {
                 }
                 Phase::NotStarted => (Poll::Ready(Err(Error::NotStarted)), None),
                 Phase::Cancelled => (Poll::Ready(Err(Error::Cancelled)), None),
-                Phase::Done(_) => match shared.take_result() {
-                    Some(value) => (Poll::Ready(Ok(value)), None),
-                    None => unreachable!("matched above"),
-                },
+                Phase::Done(_) => (
+                    Poll::Ready(Ok(shared.take_result().expect("matched above"))),
+                    None,
+                ),
             });
             wake_other(to_wake);
             poll
@@ -325,9 +332,7 @@ impl<T> StaticDeferred<T> {
     pub fn cancel(&self) -> bool {
         let (cancelled, task, waiter) = self.with(|shared| {
             if matches!(shared.phase, Phase::Pending) {
-                shared.phase = Phase::NotStarted;
-                // A new run number tells the task and any waiting `join` that this run ended.
-                shared.run = shared.run.wrapping_add(1);
+                shared.end_run();
                 (true, shared.task.take(), shared.take_waiter())
             } else {
                 (false, None, None)
@@ -461,9 +466,7 @@ impl<T> Drop for Ticket<'_, T> {
         let waiter = self.deferred.with(|shared| {
             shared.live -= 1;
             if shared.is_current(self.run) {
-                shared.phase = Phase::NotStarted;
-                // Like `cancel`: a waiting `join` sees that this run ended without a result.
-                shared.run = shared.run.wrapping_add(1);
+                shared.end_run();
             }
             shared.take_waiter()
         });

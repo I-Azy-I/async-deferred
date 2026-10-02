@@ -115,7 +115,7 @@ jobs:
       - name: Deferred reports a clear error
         if: ${{ !matrix.cas }}
         run: |
-          if cargo build --no-default-features --features alloc --target ${{ matrix.target }} 2> build.log; then
+          if cargo check --no-default-features --features alloc --target ${{ matrix.target }} 2> build.log; then
             echo "expected the build to fail without atomic compare-and-swap"
             exit 1
           fi
