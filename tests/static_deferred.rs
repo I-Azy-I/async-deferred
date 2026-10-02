@@ -689,3 +689,38 @@ fn join_after_another_join_took_the_result_and_a_new_run_began() {
         Poll::Ready(Err(Error::NotStarted))
     );
 }
+
+/// Polls two waiting futures of one task in turn, with that task's waker, and returns how
+/// often the waker was woken.
+fn wakes_for_two_waiters_in_one_task<A: Future, B: Future>(
+    mut a: Pin<&mut A>,
+    mut b: Pin<&mut B>,
+) -> usize {
+    let wakes = WakeCount::new();
+    let waker = futures_util::task::waker(wakes.clone());
+    let mut cx = Context::from_waker(&waker);
+    for _ in 0..5 {
+        assert!(a.as_mut().poll(&mut cx).is_pending());
+        assert!(b.as_mut().poll(&mut cx).is_pending());
+    }
+    wakes.get()
+}
+
+/// Two waiters in the same task, as with `join!` or `select!`, share one waker: they must
+/// not wake that task over and over.
+#[test]
+fn two_waiters_in_one_task_do_not_wake_it() {
+    let deferred = StaticDeferred::<u32>::new();
+    let _ticket = deferred.begin().unwrap();
+    let a = std::pin::pin!(deferred.join());
+    let b = std::pin::pin!(deferred.join());
+    assert_eq!(wakes_for_two_waiters_in_one_task(a, b), 0);
+
+    // `cancel_and_wait` ends the run, so a `join` beside it finishes; two of them both wait
+    // while the ticket keeps a task alive.
+    let deferred = StaticDeferred::<u32>::new();
+    let _ticket = deferred.begin().unwrap();
+    let a = std::pin::pin!(deferred.cancel_and_wait());
+    let b = std::pin::pin!(deferred.cancel_and_wait());
+    assert_eq!(wakes_for_two_waiters_in_one_task(a, b), 0);
+}

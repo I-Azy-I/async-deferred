@@ -25,10 +25,13 @@ use crate::{BeginError, Error, State};
 ///
 /// Wait on it ([`join`](Self::join) or [`cancel_and_wait`](Self::cancel_and_wait)) from one
 /// task at a time. A single waiting task is only woken when something changes, even if its
-/// executor gives it a new waker on each poll. Several waiting tasks still all finish, but
-/// they keep waking each other until then, which costs CPU time, and a `join` that ends
-/// without a result may report [`Error::Cancelled`] where [`Error::NotStarted`] would be
-/// accurate. A `join` that returns `Ok` always has the result of the run it waited for.
+/// executor gives it a new waker on each poll or waits on it twice, as with `join!` or
+/// `select!`. In that last case the check relies on [`Waker::will_wake`], which is best
+/// effort, so an executor whose wakers it can't match may still see extra wake-ups.
+/// Several waiting tasks still all finish, but they keep waking each other until then, which
+/// costs CPU time, and a `join` that ends without a result may report [`Error::Cancelled`]
+/// where [`Error::NotStarted`] would be accurate. A `join` that returns `Ok` always has the
+/// result of the run it waited for.
 ///
 /// # Examples
 ///
@@ -110,16 +113,19 @@ impl<T> Shared<T> {
 
     /// Stores the waker of the waiter with this `id`, giving it an id on its first call.
     ///
-    /// A replaced waker of the same waiter is only dropped. A replaced waker of another
-    /// waiter is returned with `true`: it must be woken so that waiter registers again, and
-    /// several waiters take turns.
+    /// - The same waker is already stored: nothing changes, whichever waiter stored it.
+    ///   Two waiters in one task, as with `join!`, share their task's waker, and waking it
+    ///   would only make that task wake itself.
+    /// - A different waker of the same waiter: the old one is only dropped.
+    /// - A waker of another waiter: it is returned with `true`, to be woken so that waiter
+    ///   registers again, and several waiters take turns.
     fn set_waiter_waker(&mut self, id: &mut Option<u32>, waker: &Waker) -> Option<(Waker, bool)> {
         let id = *id.get_or_insert_with(|| {
             self.next_waiter = self.next_waiter.wrapping_add(1);
             self.next_waiter
         });
         match &self.waiter {
-            Some(current) if current.id == id && current.waker.will_wake(waker) => None,
+            Some(current) if current.waker.will_wake(waker) => None,
             _ => self
                 .waiter
                 .replace(Waiter {
