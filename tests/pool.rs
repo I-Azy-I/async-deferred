@@ -1,4 +1,5 @@
 //! Spawning on a runtime with a fixed number of task slots, like an embassy task pool.
+#![cfg(feature = "alloc")]
 
 mod common;
 

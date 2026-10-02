@@ -22,14 +22,21 @@
   instead of panicking.
 - `State`, `Error` and `BeginError` are `#[non_exhaustive]`: a `match` on them needs a
   wildcard arm, so variants can be added later without a breaking change.
+- `Deferred` needs the new `alloc` feature, which `std` and so the default features
+  enable. Without the default features, use
+  `default-features = false, features = ["alloc"]` to keep `Deferred`.
 
 ### Added
 
+- `StaticDeferred` and `Ticket`, behind the `static-deferred` feature: a task's result kept
+  in a `static`, for targets without a heap allocator. Each kind of job gets its own
+  `static StaticDeferred` and its own task, which runs the job through the `Ticket` that
+  `begin` returns. It needs a `critical-section` implementation.
+- `rust-version = "1.68"`, checked in CI.
 - `cancel_and_wait` cancels the task and waits until its future has been dropped. On a
   single-threaded executor such as embassy, its task pool slot is free when it returns.
 - `Spawner` is implemented for `&S`, `&mut S`, `Box<S>` and `Arc<S>`, and `LocalSpawner` also
   for `Rc<S>`, where `S` is a spawner.
-- `rust-version = "1.65"`, checked in CI.
 - `into_result` and `.await` on a `Deferred` (it implements `IntoFuture`) wait for the task
   and return the owned result: `Result<T, Error>`.
 - `has_callback_panicked` and `is_cancelled`, so every `State` has an `is_*` helper.

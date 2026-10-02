@@ -1,4 +1,5 @@
 //! Behaviour of `Deferred` that does not depend on the runtime, using a thread per task.
+#![cfg(feature = "alloc")]
 
 mod common;
 

@@ -1,5 +1,6 @@
 //! Every value the crate holds must be dropped exactly once, on every path:
 //! the result, the future's state, and the callback.
+#![cfg(feature = "alloc")]
 
 mod common;
 

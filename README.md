@@ -4,7 +4,7 @@
 [![crates.io](https://img.shields.io/crates/v/async-deferred.svg)](https://crates.io/crates/async-deferred)
 [![docs.rs](https://docs.rs/async-deferred/badge.svg)](https://docs.rs/async-deferred)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
-[![no_std](https://img.shields.io/badge/no__std-alloc-green.svg)](https://docs.rust-embedded.org/book/intro/no-std.html)
+[![no_std](https://img.shields.io/badge/no__std-yes-green.svg)](https://docs.rust-embedded.org/book/intro/no-std.html)
 
 A lightweight utility for fire-and-forget async computations in Rust. Start asynchronous tasks immediately and retrieve their results later without blocking. Works with any async runtime.
 
@@ -16,7 +16,8 @@ A lightweight utility for fire-and-forget async computations in Rust. Start asyn
 - **Callback support**: run code with the result as soon as the task finishes
 - **Cancellation**: stop a running task and reuse the `Deferred`
 - **Any runtime**: Tokio by default, smol behind a feature, or your own through the `Spawner` trait
-- **`no_std`**: works on embedded executors such as embassy, with a heap allocator
+- **`no_std`**: works on embedded executors such as embassy, with a heap allocator or,
+  with `StaticDeferred`, without one
 
 The result type only needs to be `Send + 'static`, the same as `tokio::spawn`.
 
@@ -134,7 +135,9 @@ Tasks are started through a spawner, which hands them to an async runtime.
 |---|---|---|
 | `tokio` (default) | `Tokio`, `tokio::runtime::Handle`, `tokio::task::LocalSet` (local) | Enables the `start` and `begin` shortcuts used above |
 | `smol` | `Smol`, `smol::Executor`, `smol::LocalExecutor` (local) | |
-| `std` (default) | | Catches panics in the task and callback. Without it, the crate is `no_std` + `alloc` |
+| `std` (default) | | Catches panics in the task and callback. Without it, the crate is `no_std` |
+| `alloc` (with `std`) | | `Deferred`, which keeps its task on the heap |
+| `static-deferred` | | `StaticDeferred`, which needs no heap |
 
 To use another runtime without pulling in Tokio:
 
@@ -183,7 +186,7 @@ and use the `*_local_on` methods.
 ### Embassy (`no_std`)
 
 ```toml
-async-deferred = { version = "0.4", default-features = false }
+async-deferred = { version = "0.4", default-features = false, features = ["alloc"] }
 ```
 
 `embassy_spawner!` declares a spawner for embassy in one line. You also need a heap allocator,
@@ -236,6 +239,51 @@ are never reported. On embedded targets a panic usually halts the device anyway.
 
 A complete example for the ESP32-S3, with tests that run on the chip, is in
 [`embassy-esp32s3/`](https://github.com/I-Azy-I/async-deferred/tree/main/embassy-esp32s3).
+
+### Without a heap (`StaticDeferred`)
+
+```toml
+async-deferred = { version = "0.4", default-features = false, features = ["static-deferred"] }
+```
+
+`StaticDeferred` keeps the result in a `static` instead of on the heap, so it works on targets
+without an allocator and keeps memory use fixed. Each kind of job gets its own `static` and
+its own task: `begin` returns a `Ticket`, which the task uses to run the job.
+
+```rust,ignore
+use async_deferred::{StaticDeferred, Ticket};
+
+static MEASUREMENT: StaticDeferred<u32> = StaticDeferred::new();
+
+#[embassy_executor::task]
+async fn measurement_task(ticket: Ticket<'static, u32>) {
+    ticket.run(read_sensor()).await;
+}
+
+#[embassy_executor::main]
+async fn main(spawner: embassy_executor::Spawner) {
+    // If the task can't be spawned, the ticket is dropped and `MEASUREMENT` resets.
+    if let Ok(ticket) = MEASUREMENT.begin() {
+        if let Ok(token) = measurement_task(ticket) {
+            spawner.spawn(token);
+        }
+    }
+
+    // ... do other work ...
+
+    // Check for the result without waiting.
+    if let Some(value) = MEASUREMENT.take() {
+        defmt::info!("temperature: {}", value);
+    }
+}
+```
+
+All methods take `&self`, so the `static` can be used from any task. It has `state`, `take`,
+`join`, `cancel` and `cancel_and_wait` like `Deferred`, but no callbacks, and panics in the
+job are not caught. It needs a
+[`critical-section`](https://docs.rs/critical-section) implementation, which embassy and the
+HALs provide. A complete example for the ESP32-S3, with tests that run on the chip, is in
+[`embassy-esp32s3-no-heap/`](https://github.com/I-Azy-I/async-deferred/tree/main/embassy-esp32s3-no-heap).
 
 ## License
 

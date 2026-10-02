@@ -81,12 +81,17 @@ macro_rules! forward_local_spawner {
     )*};
 }
 
-forward_spawner!(&S, &mut S, alloc::boxed::Box<S>);
-forward_local_spawner!(&S, &mut S, alloc::boxed::Box<S>, alloc::rc::Rc<S>);
+forward_spawner!(&S, &mut S);
+forward_local_spawner!(&S, &mut S);
 
-#[cfg(target_has_atomic = "ptr")]
+#[cfg(feature = "alloc")]
+forward_spawner!(alloc::boxed::Box<S>);
+#[cfg(feature = "alloc")]
+forward_local_spawner!(alloc::boxed::Box<S>, alloc::rc::Rc<S>);
+
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
 forward_spawner!(alloc::sync::Arc<S>);
-#[cfg(target_has_atomic = "ptr")]
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
 forward_local_spawner!(alloc::sync::Arc<S>);
 
 /// Spawns on the current Tokio runtime.

@@ -4,7 +4,9 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use async_deferred::{Deferred, LocalSpawner, SpawnError, Spawner};
+#[cfg(feature = "alloc")]
+use async_deferred::Deferred;
+use async_deferred::{LocalSpawner, SpawnError, Spawner};
 use futures_channel::oneshot;
 
 /// Runs each task on its own thread.
@@ -58,6 +60,7 @@ impl LocalSpawner for PoolSpawner {
 }
 
 /// Busy-waits until the task is no longer pending.
+#[cfg(feature = "alloc")]
 pub fn wait_until_finished<T>(deferred: &mut Deferred<T>) {
     while deferred.is_pending() {
         std::thread::yield_now();

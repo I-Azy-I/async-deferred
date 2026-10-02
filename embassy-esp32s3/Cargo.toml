@@ -34,7 +34,7 @@ embassy-time     = { version = "0.5.0", features = ["defmt"] }
 esp-alloc        = { version = "0.11.0", features = ["defmt", "esp32s3"] }
 rtt-target       = { version = "0.6.2", features = ["defmt"] }
 
-async-deferred   = { path = "..", default-features = false }
+async-deferred   = { path = "..", default-features = false, features = ["alloc"] }
 critical-section = "1.2.0"
 static_cell      = "2.1.1"
 

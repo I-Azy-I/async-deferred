@@ -1,4 +1,5 @@
 //! `LocalSpawner` and the `*_local_on` methods, using a single-threaded `LocalPool`.
+#![cfg(feature = "alloc")]
 
 mod common;
 
