@@ -1,5 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![cfg_attr(not(feature = "std"), no_std)]
+// On docs.rs, label each item with the features it needs.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
@@ -19,12 +21,16 @@ pub mod __private {
 }
 
 #[cfg(feature = "alloc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
 pub use deferred::{Deferred, IntoResult};
 pub use error::{BeginError, Error, SpawnError, State};
 #[cfg(feature = "smol")]
+#[cfg_attr(docsrs, doc(cfg(feature = "smol")))]
 pub use spawner::Smol;
 #[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub use spawner::Tokio;
 pub use spawner::{LocalSpawner, Spawner};
 #[cfg(feature = "static-deferred")]
+#[cfg_attr(docsrs, doc(cfg(feature = "static-deferred")))]
 pub use static_deferred::{StaticDeferred, Ticket};
