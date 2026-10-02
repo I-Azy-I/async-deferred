@@ -70,6 +70,20 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  docs-rs:
+    name: docs.rs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+
+      # Same settings as docs.rs, which labels each item with the features it needs.
+      - name: Docs as on docs.rs
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
+
   no-std:
     name: no_std (${{ matrix.target }})
     runs-on: ubuntu-latest

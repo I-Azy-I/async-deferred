@@ -55,8 +55,11 @@ pub trait LocalSpawner {
         F: Future<Output = ()> + 'static;
 }
 
+/// Implements `Spawner` for pointers to a spawner. An optional attribute, such as a `cfg`,
+/// is put on each impl, so docs.rs shows which feature it needs.
 macro_rules! forward_spawner {
-    ($($pointer:ty),*) => {$(
+    (@impl [$($attr:meta)?] $pointer:ty) => {
+        $(#[$attr])?
         impl<S: Spawner + ?Sized> Spawner for $pointer {
             fn spawn<F>(&self, task: F) -> Result<(), SpawnError>
             where
@@ -65,11 +68,15 @@ macro_rules! forward_spawner {
                 (**self).spawn(task)
             }
         }
-    )*};
+    };
+    (#[$attr:meta] $($pointer:ty),*) => { $(forward_spawner!(@impl [$attr] $pointer);)* };
+    ($($pointer:ty),*) => { $(forward_spawner!(@impl [] $pointer);)* };
 }
 
+/// Same as `forward_spawner`, for `LocalSpawner`.
 macro_rules! forward_local_spawner {
-    ($($pointer:ty),*) => {$(
+    (@impl [$($attr:meta)?] $pointer:ty) => {
+        $(#[$attr])?
         impl<S: LocalSpawner + ?Sized> LocalSpawner for $pointer {
             fn spawn_local<F>(&self, task: F) -> Result<(), SpawnError>
             where
@@ -78,21 +85,19 @@ macro_rules! forward_local_spawner {
                 (**self).spawn_local(task)
             }
         }
-    )*};
+    };
+    (#[$attr:meta] $($pointer:ty),*) => { $(forward_local_spawner!(@impl [$attr] $pointer);)* };
+    ($($pointer:ty),*) => { $(forward_local_spawner!(@impl [] $pointer);)* };
 }
 
 forward_spawner!(&S, &mut S);
 forward_local_spawner!(&S, &mut S);
 
-#[cfg(feature = "alloc")]
-forward_spawner!(alloc::boxed::Box<S>);
-#[cfg(feature = "alloc")]
-forward_local_spawner!(alloc::boxed::Box<S>, alloc::rc::Rc<S>);
+forward_spawner!(#[cfg(feature = "alloc")] alloc::boxed::Box<S>);
+forward_local_spawner!(#[cfg(feature = "alloc")] alloc::boxed::Box<S>, alloc::rc::Rc<S>);
 
-#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
-forward_spawner!(alloc::sync::Arc<S>);
-#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
-forward_local_spawner!(alloc::sync::Arc<S>);
+forward_spawner!(#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))] alloc::sync::Arc<S>);
+forward_local_spawner!(#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))] alloc::sync::Arc<S>);
 
 /// Spawns on the current Tokio runtime.
 ///
