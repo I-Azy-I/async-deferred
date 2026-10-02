@@ -592,3 +592,84 @@ fn wakers_are_dropped_outside_the_critical_section() {
         .is_ready());
     assert_eq!(REENTRANT.take(), Some(5));
 }
+
+/// Polls `future` with five different wakers and returns how often each was woken.
+fn wakes_while_polled_with_new_wakers<F: Future>(mut future: Pin<&mut F>) -> Vec<usize> {
+    let counts: Vec<_> = (0..5).map(|_| WakeCount::new()).collect();
+    for count in &counts {
+        let waker = futures_util::task::waker(count.clone());
+        assert!(future
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+    }
+    counts.iter().map(|count| count.get()).collect()
+}
+
+/// A task polled with a new waker each time must not wake itself, or it would be polled
+/// again and again until the job finishes.
+#[test]
+fn running_task_does_not_wake_itself() {
+    let deferred = StaticDeferred::<u32>::new();
+    let ticket = deferred.begin().unwrap();
+    let run = std::pin::pin!(ticket.run(std::future::pending()));
+    assert_eq!(wakes_while_polled_with_new_wakers(run), [0; 5]);
+}
+
+#[test]
+fn single_join_does_not_wake_itself() {
+    let deferred = StaticDeferred::<u32>::new();
+    let _ticket = deferred.begin().unwrap();
+    let join = std::pin::pin!(deferred.join());
+    assert_eq!(wakes_while_polled_with_new_wakers(join), [0; 5]);
+}
+
+#[test]
+fn single_cancel_and_wait_does_not_wake_itself() {
+    let deferred = StaticDeferred::<u32>::new();
+    let _ticket = deferred.begin().unwrap(); // keeps a task alive, so it waits
+    let wait = std::pin::pin!(deferred.cancel_and_wait());
+    assert_eq!(wakes_while_polled_with_new_wakers(wait), [0; 5]);
+}
+
+/// A second waiter still wakes the first, so both keep registering in turn.
+#[test]
+fn another_waiter_is_still_woken() {
+    let deferred = StaticDeferred::<u32>::new();
+    let _ticket = deferred.begin().unwrap();
+    let (first, second) = (WakeCount::new(), WakeCount::new());
+    let first_waker = futures_util::task::waker(first.clone());
+    let second_waker = futures_util::task::waker(second.clone());
+
+    let mut join1 = std::pin::pin!(deferred.join());
+    let mut join2 = std::pin::pin!(deferred.join());
+    assert!(join1
+        .as_mut()
+        .poll(&mut Context::from_waker(&first_waker))
+        .is_pending());
+    assert!(join2
+        .as_mut()
+        .poll(&mut Context::from_waker(&second_waker))
+        .is_pending());
+    assert_eq!((first.get(), second.get()), (1, 0));
+}
+
+/// Until its first poll, the `run` future still holds the ticket: dropping it then counts as
+/// dropping an unrun ticket.
+#[test]
+fn run_dropped_before_its_first_poll() {
+    let deferred = StaticDeferred::<u32>::new();
+    let ticket = deferred.begin().unwrap();
+    drop(ticket.run(async { 1 }));
+    assert_eq!(deferred.state(), State::NotStarted);
+
+    // Once it has started running, dropping it reports a cancelled run.
+    let ticket = deferred.begin().unwrap();
+    let mut run = Box::pin(ticket.run(std::future::pending()));
+    assert!(run
+        .as_mut()
+        .poll(&mut Context::from_waker(noop_waker_ref()))
+        .is_pending());
+    drop(run);
+    assert_eq!(deferred.state(), State::Cancelled);
+}

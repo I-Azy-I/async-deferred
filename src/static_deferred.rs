@@ -24,10 +24,11 @@ use crate::{BeginError, Error, State};
 /// such as `std`, the `StaticDeferred` then reports [`State::Cancelled`].
 ///
 /// Wait on it ([`join`](Self::join) or [`cancel_and_wait`](Self::cancel_and_wait)) from one
-/// task at a time. Several waiting tasks still all finish, but they keep waking each other
-/// until then, which costs CPU time, and a `join` that ends without a result may report
-/// [`Error::Cancelled`] where [`Error::NotStarted`] would be accurate. A `join` that returns
-/// `Ok` always has the result of the run it waited for.
+/// task at a time. A single waiting task is only woken when something changes, even if its
+/// executor gives it a new waker on each poll. Several waiting tasks still all finish, but
+/// they keep waking each other until then, which costs CPU time, and a `join` that ends
+/// without a result may report [`Error::Cancelled`] where [`Error::NotStarted`] would be
+/// accurate. A `join` that returns `Ok` always has the result of the run it waited for.
 ///
 /// # Examples
 ///
@@ -65,10 +66,18 @@ struct Shared<T> {
     /// The task of the current run, woken when it is cancelled.
     task: Option<Waker>,
     /// Whoever waits in `join` or `cancel_and_wait`.
-    waiter: Option<Waker>,
+    waiter: Option<Waiter>,
+    /// The id given to the next waiter, to tell waiters apart.
+    next_waiter: u32,
     /// The run a `join` waits for, and whether its result was taken by someone else.
     /// Only that run's outcome is kept, so later runs can't change what the `join` reports.
     awaited: Option<Awaited>,
+}
+
+/// A waiting task's waker, with the id of its `join` or `cancel_and_wait`.
+struct Waiter {
+    id: u32,
+    waker: Waker,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -88,14 +97,48 @@ impl<T> Shared<T> {
     fn is_current(&self, run: u32) -> bool {
         self.run == run && matches!(self.phase, Phase::Pending)
     }
+
+    /// Stores the waker of the task running the current run. The waker it replaces belongs
+    /// to that same task, so it is returned to be dropped, not woken: waking it would make
+    /// the task poll itself again and again.
+    fn set_task_waker(&mut self, waker: &Waker) -> Option<Waker> {
+        match &self.task {
+            Some(current) if current.will_wake(waker) => None,
+            _ => self.task.replace(waker.clone()),
+        }
+    }
+
+    /// Stores the waker of the waiter with this `id`, giving it an id on its first call.
+    ///
+    /// A replaced waker of the same waiter is only dropped. A replaced waker of another
+    /// waiter is returned with `true`: it must be woken so that waiter registers again, and
+    /// several waiters take turns.
+    fn set_waiter_waker(&mut self, id: &mut Option<u32>, waker: &Waker) -> Option<(Waker, bool)> {
+        let id = *id.get_or_insert_with(|| {
+            self.next_waiter = self.next_waiter.wrapping_add(1);
+            self.next_waiter
+        });
+        match &self.waiter {
+            Some(current) if current.id == id && current.waker.will_wake(waker) => None,
+            _ => self
+                .waiter
+                .replace(Waiter {
+                    id,
+                    waker: waker.clone(),
+                })
+                .map(|old| (old.waker, old.id != id)),
+        }
+    }
+
+    fn take_waiter(&mut self) -> Option<Waker> {
+        self.waiter.take().map(|waiter| waiter.waker)
+    }
 }
 
-/// Stores `waker` in `slot`. A different waker already there is returned so it can be woken
-/// and register again: several waiters keep making progress, by polling in turn.
-fn register(slot: &mut Option<Waker>, waker: &Waker) -> Option<Waker> {
-    match slot {
-        Some(current) if current.will_wake(waker) => None,
-        _ => slot.replace(waker.clone()),
+/// Wakes a replaced waker of another waiter; a waiter's own old waker is just dropped.
+fn wake_other(replaced: Option<(Waker, bool)>) {
+    if let Some((waker, true)) = replaced {
+        waker.wake();
     }
 }
 
@@ -115,6 +158,7 @@ impl<T> StaticDeferred<T> {
                 live: 0,
                 task: None,
                 waiter: None,
+                next_waiter: 0,
                 awaited: None,
             })),
         }
@@ -224,6 +268,7 @@ impl<T> StaticDeferred<T> {
     pub async fn join(&self) -> Result<T, Error> {
         // The run this `join` waits for, once it has seen one in progress.
         let mut waiting_for = None;
+        let mut waiter_id = None;
         poll_fn(|cx| {
             let (poll, to_wake) = self.with(|shared| match shared.phase {
                 // The awaited run ended and a new run number was given out since.
@@ -248,7 +293,10 @@ impl<T> StaticDeferred<T> {
                             taken: false,
                         });
                     }
-                    (Poll::Pending, register(&mut shared.waiter, cx.waker()))
+                    (
+                        Poll::Pending,
+                        shared.set_waiter_waker(&mut waiter_id, cx.waker()),
+                    )
                 }
                 Phase::NotStarted => (Poll::Ready(Err(Error::NotStarted)), None),
                 Phase::Cancelled => (Poll::Ready(Err(Error::Cancelled)), None),
@@ -257,7 +305,7 @@ impl<T> StaticDeferred<T> {
                     _ => unreachable!("matched above"),
                 },
             });
-            wake(to_wake);
+            wake_other(to_wake);
             poll
         })
         .await
@@ -275,7 +323,7 @@ impl<T> StaticDeferred<T> {
                 shared.phase = Phase::NotStarted;
                 // A new run number tells the task and any waiting `join` that this run ended.
                 shared.run = shared.run.wrapping_add(1);
-                (true, shared.task.take(), shared.waiter.take())
+                (true, shared.task.take(), shared.take_waiter())
             } else {
                 (false, None, None)
             }
@@ -296,15 +344,19 @@ impl<T> StaticDeferred<T> {
     /// Returns `true` if a run was in progress.
     pub async fn cancel_and_wait(&self) -> bool {
         let cancelled = self.cancel();
+        let mut waiter_id = None;
         poll_fn(|cx| {
             let (poll, to_wake) = self.with(|shared| {
                 if shared.live == 0 {
                     (Poll::Ready(()), None)
                 } else {
-                    (Poll::Pending, register(&mut shared.waiter, cx.waker()))
+                    (
+                        Poll::Pending,
+                        shared.set_waiter_waker(&mut waiter_id, cx.waker()),
+                    )
                 }
             });
-            wake(to_wake);
+            wake_other(to_wake);
             poll
         })
         .await;
@@ -348,7 +400,10 @@ impl<'a, T> Ticket<'a, T> {
     /// Runs `future` and stores its output in the [`StaticDeferred`].
     ///
     /// Returns early, without storing anything, if the run is cancelled. If this future is
-    /// dropped before it finishes, the `StaticDeferred` reports [`State::Cancelled`].
+    /// dropped after its first poll but before it finishes, the `StaticDeferred` reports
+    /// [`State::Cancelled`]. Dropped before its first poll, it still holds the ticket, so it
+    /// counts as a ticket dropped without running: the state goes back to
+    /// [`State::NotStarted`].
     pub async fn run<F>(self, future: F)
     where
         F: Future<Output = T>,
@@ -362,14 +417,15 @@ impl<'a, T> Ticket<'a, T> {
 
         let mut future = pin!(future);
         let output = poll_fn(|cx| {
-            let (current, to_wake) = running.deferred.with(|shared| {
+            let (current, replaced) = running.deferred.with(|shared| {
                 if shared.is_current(running.run) {
-                    (true, register(&mut shared.task, cx.waker()))
+                    (true, shared.set_task_waker(cx.waker()))
                 } else {
                     (false, None)
                 }
             });
-            wake(to_wake);
+            // This task's own old waker: dropped outside the critical section, not woken.
+            drop(replaced);
             if !current {
                 return Poll::Ready(None);
             }
@@ -381,7 +437,7 @@ impl<'a, T> Ticket<'a, T> {
             let (leftover, waiter, task) = running.deferred.with(move |shared| {
                 if shared.is_current(running.run) {
                     shared.phase = Phase::Done(value);
-                    (None, shared.waiter.take(), shared.task.take())
+                    (None, shared.take_waiter(), shared.task.take())
                 } else {
                     // Cancelled while finishing: discard the value.
                     (Some(value), None, None)
@@ -404,7 +460,7 @@ impl<T> Drop for Ticket<'_, T> {
                 // Like `cancel`: a waiting `join` sees that this run ended without a result.
                 shared.run = shared.run.wrapping_add(1);
             }
-            shared.waiter.take()
+            shared.take_waiter()
         });
         wake(waiter);
     }
@@ -426,7 +482,7 @@ impl<T> Drop for Running<'_, T> {
             } else {
                 None
             };
-            (shared.waiter.take(), task)
+            (shared.take_waiter(), task)
         });
         // Dropped outside the critical section: its `Drop` may run any code.
         drop(task);
