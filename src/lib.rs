@@ -3,7 +3,13 @@
 
 extern crate alloc;
 
+mod embassy;
 mod spawner;
+
+#[doc(hidden)]
+pub mod __private {
+    pub use alloc::boxed::Box;
+}
 
 use alloc::string::String;
 use core::fmt;

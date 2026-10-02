@@ -30,6 +30,7 @@
 - `LocalSpawner` trait and `start_local_on`, `start_with_callback_local_on`,
   `begin_local_on` and `begin_with_callback_local_on`, for futures that are not `Send`
   and single-threaded executors such as embassy.
+- `embassy_spawner!` declares a `LocalSpawner` for embassy in one line.
 - `State::Cancelled` and `Error::Cancelled`, reported when the runtime drops the task
   before it finishes, for example on shutdown. This used to be reported as a panic.
 - `panic_message()` returns the panic message of the task or its callback.

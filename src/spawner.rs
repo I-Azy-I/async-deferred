@@ -43,32 +43,7 @@ pub trait Spawner {
 ///
 /// # Embassy
 ///
-/// Embassy only spawns tasks declared with `#[embassy_executor::task]`, so declare one
-/// task that runs a boxed future and spawn through it. This needs a heap allocator,
-/// such as `esp-alloc` or `embedded-alloc`. The pool size limits how many tasks can run
-/// at once.
-///
-/// ```rust,ignore
-/// use core::{future::Future, pin::Pin};
-/// use alloc::boxed::Box;
-/// use async_deferred::{Deferred, LocalSpawner};
-///
-/// #[embassy_executor::task(pool_size = 4)]
-/// async fn run(task: Pin<Box<dyn Future<Output = ()>>>) {
-///     task.await
-/// }
-///
-/// struct Embassy(embassy_executor::Spawner);
-///
-/// impl LocalSpawner for Embassy {
-///     fn spawn_local<F>(&self, task: F)
-///     where
-///         F: Future<Output = ()> + 'static,
-///     {
-///         self.0.spawn(run(Box::pin(task)).expect("task pool is full"));
-///     }
-/// }
-/// ```
+/// Use [`embassy_spawner!`](crate::embassy_spawner) to declare a `LocalSpawner` for embassy.
 pub trait LocalSpawner {
     /// Runs `task` in the background.
     fn spawn_local<F>(&self, task: F)

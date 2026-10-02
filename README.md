@@ -174,26 +174,45 @@ and use the `*_local_on` methods.
 async-deferred = { version = "0.3", default-features = false }
 ```
 
-Embassy only spawns tasks declared with `#[embassy_executor::task]`, so declare one task that
-runs a boxed future and implement `LocalSpawner` with it. This needs a heap allocator such as
-`esp-alloc` or `embedded-alloc`, and a target with atomic compare-and-swap.
+`embassy_spawner!` declares a spawner for embassy in one line. You also need a heap allocator,
+such as `esp-alloc` or `embedded-alloc`, and a target with atomic compare-and-swap.
 
 ```rust,ignore
-#[embassy_executor::task(pool_size = 4)]
-async fn run(task: Pin<Box<dyn Future<Output = ()>>>) {
-    task.await
-}
+use async_deferred::{embassy_spawner, Deferred};
+use embassy_time::{Duration, Instant, Timer};
 
-struct Embassy(embassy_executor::Spawner);
+// Lets up to 4 `Deferred` tasks run at the same time.
+embassy_spawner!(DeferredSpawner, pool_size = 4);
 
-impl LocalSpawner for Embassy {
-    fn spawn_local<F: Future<Output = ()> + 'static>(&self, task: F) {
-        self.0.spawn(run(Box::pin(task)).expect("task pool is full"));
+#[embassy_executor::main]
+async fn main(spawner: embassy_executor::Spawner) {
+    // ... set up the heap allocator and the time driver ...
+    let spawner = DeferredSpawner(spawner);
+
+    let mut measurement = Deferred::start_local_on(&spawner, read_sensor());
+    let mut started = Instant::now();
+
+    loop {
+        // The main loop's own work.
+        Timer::after(Duration::from_millis(100)).await;
+
+        // Check for the result without waiting.
+        if let Some(value) = measurement.take() {
+            defmt::info!("temperature: {}", value);
+        } else if started.elapsed() > Duration::from_millis(500) {
+            measurement.cancel(); // the sensor hung: give up
+        } else {
+            continue;
+        }
+
+        // `take` and `cancel` reset the `Deferred`, so it can start the next measurement.
+        measurement.begin_local_on(&spawner, read_sensor());
+        started = Instant::now();
     }
 }
-
-let mut reading = Deferred::start_local_on(&Embassy(spawner), read_sensor());
 ```
 
+The futures can hold values that are not `Send`, such as `Rc` or peripheral drivers.
+Starting more than `pool_size` tasks at the same time panics.
 Without the `std` feature, panics are not caught, so `TaskPanicked` and `CallbackPanicked`
 are never reported. On embedded targets a panic usually halts the device anyway.
