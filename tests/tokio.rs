@@ -180,7 +180,7 @@ async fn local_set_runs_non_send_future() {
 #[test]
 fn dropped_local_set_reports_cancelled() {
     let local = tokio::task::LocalSet::new();
-    let mut deferred = Deferred::start_local_on(&local, std::future::pending::<u32>()).unwrap();
+    let deferred = Deferred::start_local_on(&local, std::future::pending::<u32>()).unwrap();
     drop(local);
     assert!(deferred.is_cancelled());
 }

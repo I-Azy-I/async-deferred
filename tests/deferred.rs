@@ -124,6 +124,46 @@ fn non_sync_result() {
     assert_eq!(block_on(deferred.join()).map(Cell::get), Ok(42));
 }
 
+// --- status through a shared reference ---
+
+fn describe(deferred: &Deferred<u32>) -> &'static str {
+    if deferred.is_pending() {
+        "busy"
+    } else if deferred.is_ready() {
+        "done"
+    } else {
+        "idle"
+    }
+}
+
+#[test]
+fn status_through_a_shared_reference() {
+    let (tx, rx) = oneshot::channel();
+    let mut deferred = Deferred::new();
+    assert_eq!(describe(&deferred), "idle");
+    deferred
+        .begin_on(&ThreadSpawner, async { rx.await.unwrap() })
+        .unwrap();
+    assert_eq!(describe(&deferred), "busy");
+    tx.send(42).unwrap();
+    while describe(&deferred) == "busy" {
+        std::thread::yield_now();
+    }
+    assert_eq!(describe(&deferred), "done");
+    assert_eq!(deferred.take(), Some(42));
+}
+
+#[test]
+fn status_matches_after_the_result_is_received() {
+    let mut deferred = Deferred::start_on(&ThreadSpawner, async { 42 }).unwrap();
+    while deferred.is_pending() {
+        std::thread::yield_now();
+    }
+    assert_eq!(deferred.state(), State::Completed);
+    assert_eq!(deferred.try_get(), Some(&42));
+    assert_eq!(deferred.state(), State::Completed);
+}
+
 // --- owned result ---
 
 #[test]
@@ -370,11 +410,10 @@ fn restart_after_task_dropped_by_runtime() {
 fn task_dropped_by_runtime_does_not_run_callback() {
     let ran = Flag::default();
     let ran_in_callback = ran.clone();
-    let mut deferred =
-        Deferred::start_with_callback_on(&DroppingSpawner, async { 42 }, move |_| {
-            ran_in_callback.set()
-        })
-        .unwrap();
+    let deferred = Deferred::start_with_callback_on(&DroppingSpawner, async { 42 }, move |_| {
+        ran_in_callback.set()
+    })
+    .unwrap();
     assert_eq!(deferred.state(), State::Cancelled);
     assert!(!ran.is_set());
 }

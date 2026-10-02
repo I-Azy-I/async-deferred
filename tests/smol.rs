@@ -51,7 +51,7 @@ fn start_on_executor() {
 #[test]
 fn executor_drop_reports_cancelled() {
     let executor = smol::Executor::new();
-    let mut deferred = Deferred::start_on(&executor, std::future::pending::<u32>()).unwrap();
+    let deferred = Deferred::start_on(&executor, std::future::pending::<u32>()).unwrap();
     drop(executor);
     assert_eq!(deferred.state(), State::Cancelled);
 }
@@ -80,7 +80,7 @@ fn local_executor_runs_non_send_future() {
 #[test]
 fn dropped_local_executor_reports_cancelled() {
     let executor = smol::LocalExecutor::new();
-    let mut deferred = Deferred::start_local_on(&executor, std::future::pending::<u32>()).unwrap();
+    let deferred = Deferred::start_local_on(&executor, std::future::pending::<u32>()).unwrap();
     drop(executor);
     assert!(deferred.is_cancelled());
 }

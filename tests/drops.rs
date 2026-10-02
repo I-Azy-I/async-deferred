@@ -140,7 +140,7 @@ fn future_state_dropped_on_cancel() {
 fn future_state_dropped_by_runtime() {
     let tracker = DropTracker::default();
     let held = tracker.track(0);
-    let mut deferred = Deferred::start_on(&DroppingSpawner, async move {
+    let deferred = Deferred::start_on(&DroppingSpawner, async move {
         let _held = held;
         1
     })

@@ -371,6 +371,11 @@ fn run_ops(ops: &[Op]) -> Result<(), TestCaseError> {
             }
         }
 
+        // The flag read through `&self` must agree with the channel, read through `&mut`.
+        let observed = deferred.state();
+        let _ = deferred.panic_message(); // receives the outcome if there is one
+        prop_assert_eq!(observed, deferred.state(), "flag vs channel after {:?}", op);
+
         // After every operation, all queries must agree with the model.
         prop_assert_eq!(deferred.state(), model.state(), "state after {:?}", op);
         prop_assert_eq!(deferred.is_pending(), model.state() == State::Pending);

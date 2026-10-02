@@ -102,7 +102,7 @@ fn cancel_stops_local_task() {
 #[test]
 fn dropped_pool_reports_cancelled() {
     let pool = LocalPool::new();
-    let mut deferred =
+    let deferred =
         Deferred::start_local_on(&PoolSpawner(pool.spawner()), std::future::pending::<u32>())
             .unwrap();
     drop(pool);

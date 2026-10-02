@@ -12,9 +12,11 @@ pub mod __private {
 }
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use core::fmt;
 use core::future::{Future, IntoFuture};
 use core::pin::Pin;
+use core::sync::atomic::{AtomicU8, Ordering};
 use core::task::{Context, Poll};
 
 use futures_channel::oneshot;
@@ -151,6 +153,8 @@ enum Inner<T> {
     Running {
         receiver: oneshot::Receiver<Outcome<T>>,
         abort: AbortHandle,
+        /// Set by the task once it has finished; see [`TaskStatus`].
+        status: Arc<AtomicU8>,
     },
     Done {
         value: T,
@@ -421,11 +425,15 @@ impl<T> Deferred<T> {
     }
 
     /// Returns the current [`State`] without waiting.
-    pub fn state(&mut self) -> State {
-        self.poll_task();
+    ///
+    /// The state is a snapshot: a task that has just finished may still show as
+    /// [`State::Pending`] for an instant. Once it shows as finished, its result is
+    /// available to [`try_get`](Self::try_get), [`take`](Self::take) and
+    /// [`join`](Self::join).
+    pub fn state(&self) -> State {
         match &self.inner {
             Inner::NotStarted => State::NotStarted,
-            Inner::Running { .. } => State::Pending,
+            Inner::Running { status, .. } => TaskStatus::load(status),
             Inner::Done {
                 callback_panic: None,
                 ..
@@ -542,8 +550,9 @@ impl<T> Deferred<T> {
         if !matches!(self.inner, Inner::Running { .. }) {
             return false;
         }
-        let Inner::Running { receiver, abort } =
-            core::mem::replace(&mut self.inner, Inner::NotStarted)
+        let Inner::Running {
+            receiver, abort, ..
+        } = core::mem::replace(&mut self.inner, Inner::NotStarted)
         else {
             unreachable!("checked above")
         };
@@ -554,32 +563,32 @@ impl<T> Deferred<T> {
     }
 
     /// Returns `true` if the result is available, even if the callback panicked.
-    pub fn is_ready(&mut self) -> bool {
-        self.try_get().is_some()
+    pub fn is_ready(&self) -> bool {
+        matches!(self.state(), State::Completed | State::CallbackPanicked)
     }
 
     /// Returns `true` if the task and its callback finished without panicking.
-    pub fn is_complete(&mut self) -> bool {
+    pub fn is_complete(&self) -> bool {
         self.state() == State::Completed
     }
 
     /// Returns `true` if the task is still running.
-    pub fn is_pending(&mut self) -> bool {
+    pub fn is_pending(&self) -> bool {
         self.state() == State::Pending
     }
 
     /// Returns `true` if no task has been started, or its result was taken.
-    pub fn is_not_started(&mut self) -> bool {
+    pub fn is_not_started(&self) -> bool {
         self.state() == State::NotStarted
     }
 
     /// Returns `true` if the task panicked.
-    pub fn has_task_panicked(&mut self) -> bool {
+    pub fn has_task_panicked(&self) -> bool {
         self.state() == State::TaskPanicked
     }
 
     /// Returns `true` if the task finished but its callback panicked.
-    pub fn has_callback_panicked(&mut self) -> bool {
+    pub fn has_callback_panicked(&self) -> bool {
         self.state() == State::CallbackPanicked
     }
 
@@ -587,7 +596,7 @@ impl<T> Deferred<T> {
     ///
     /// A task stopped with [`cancel`](Self::cancel) is not reported here: cancelling resets
     /// the `Deferred` to [`State::NotStarted`].
-    pub fn is_cancelled(&mut self) -> bool {
+    pub fn is_cancelled(&self) -> bool {
         self.state() == State::Cancelled
     }
 }
@@ -752,6 +761,12 @@ where
 {
     let (sender, receiver) = oneshot::channel();
     let (abort, abort_registration) = AbortHandle::new_pair();
+    let status = Arc::new(AtomicU8::new(TaskStatus::PENDING));
+    // Created now, so it also reports a task the runtime drops before ever running it.
+    let reporter = Reporter {
+        sender: Some(sender),
+        status: status.clone(),
+    };
     let task = Abortable::new(
         async move {
             let outcome = match catch_unwind(future).await {
@@ -762,15 +777,79 @@ where
                 }
                 Err(msg) => Err(msg),
             };
-            // The `Deferred` may have been dropped; the result is then discarded.
-            let _ = sender.send(outcome);
+            reporter.finish(outcome);
         },
         abort_registration,
     );
     let task = async move {
         let _ = task.await;
     };
-    (task, Inner::Running { receiver, abort })
+    (
+        task,
+        Inner::Running {
+            receiver,
+            abort,
+            status,
+        },
+    )
+}
+
+/// The values of the status flag a running task shares with its `Deferred`.
+///
+/// The flag lets [`Deferred::state`] work through `&self`. The task stores it after
+/// sending its outcome, so once the flag says the task has finished, the outcome is in
+/// the channel.
+struct TaskStatus;
+
+impl TaskStatus {
+    const PENDING: u8 = 0;
+    const COMPLETED: u8 = 1;
+    const CALLBACK_PANICKED: u8 = 2;
+    const TASK_PANICKED: u8 = 3;
+    const CANCELLED: u8 = 4;
+
+    fn load(status: &AtomicU8) -> State {
+        match status.load(Ordering::Acquire) {
+            Self::PENDING => State::Pending,
+            Self::COMPLETED => State::Completed,
+            Self::CALLBACK_PANICKED => State::CallbackPanicked,
+            Self::TASK_PANICKED => State::TaskPanicked,
+            _ => State::Cancelled,
+        }
+    }
+}
+
+/// Owned by the task: sends its outcome and sets the status flag.
+///
+/// If the task is dropped before finishing, it closes the channel and then marks the
+/// task cancelled, in that order, so the flag never runs ahead of the channel.
+struct Reporter<T> {
+    sender: Option<oneshot::Sender<Outcome<T>>>,
+    status: Arc<AtomicU8>,
+}
+
+impl<T> Reporter<T> {
+    fn finish(mut self, outcome: Outcome<T>) {
+        let status = match &outcome {
+            Ok((_, None)) => TaskStatus::COMPLETED,
+            Ok((_, Some(_))) => TaskStatus::CALLBACK_PANICKED,
+            Err(_) => TaskStatus::TASK_PANICKED,
+        };
+        if let Some(sender) = self.sender.take() {
+            // The `Deferred` may have been dropped; the result is then discarded.
+            let _ = sender.send(outcome);
+        }
+        self.status.store(status, Ordering::Release);
+    }
+}
+
+impl<T> Drop for Reporter<T> {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            drop(sender);
+            self.status.store(TaskStatus::CANCELLED, Ordering::Release);
+        }
+    }
 }
 
 /// Awaits `future`, turning a panic into its message.
