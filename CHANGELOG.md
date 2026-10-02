@@ -31,7 +31,8 @@
 - `StaticDeferred` and `Ticket`, behind the `static-deferred` feature: a task's result kept
   in a `static`, for targets without a heap allocator. Each kind of job gets its own
   `static StaticDeferred` and its own task, which runs the job through the `Ticket` that
-  `begin` returns. It needs a `critical-section` implementation.
+  `begin` returns. It needs a `critical-section` implementation: embassy and the HALs
+  provide one, and `std` programs add `critical-section` with its `std` feature.
 - `rust-version = "1.68"`, checked in CI.
 - `cancel_and_wait` cancels the task and waits until its future has been dropped. On a
   single-threaded executor such as embassy, its task pool slot is free when it returns.

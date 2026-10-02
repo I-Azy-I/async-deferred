@@ -282,7 +282,10 @@ All methods take `&self`, so the `static` can be used from any task. It has `sta
 `join`, `cancel` and `cancel_and_wait` like `Deferred`, but no callbacks, and panics in the
 job are not caught. It needs a
 [`critical-section`](https://docs.rs/critical-section) implementation, which embassy and the
-HALs provide. A complete example for the ESP32-S3, with tests that run on the chip, is in
+HALs provide. On `std`, add `critical-section = { version = "1", features = ["std"] }` to your
+dependencies; without one, linking fails with `undefined symbol: _critical_section_1_0_acquire`.
+
+A complete example for the ESP32-S3, with tests that run on the chip, is in
 [`embassy-esp32s3-no-heap/`](https://github.com/I-Azy-I/async-deferred/tree/main/embassy-esp32s3-no-heap).
 
 ## License

@@ -27,6 +27,7 @@
 ///     let value = reading.join().await;
 /// }
 /// ```
+#[cfg(feature = "alloc")]
 #[macro_export]
 macro_rules! embassy_spawner {
     ($vis:vis $name:ident, pool_size = $pool_size:expr) => {
@@ -58,5 +59,19 @@ macro_rules! embassy_spawner {
                 ::core::result::Result::Ok(())
             }
         }
+    };
+}
+
+/// Without the `alloc` feature, `embassy_spawner!` only reports what is missing.
+#[cfg(not(feature = "alloc"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! embassy_spawner {
+    ($($input:tt)*) => {
+        ::core::compile_error!(
+            "`embassy_spawner!` needs the `alloc` feature of async-deferred, because `Deferred` \
+             keeps its tasks on the heap. Without a heap, use `StaticDeferred` \
+             (the `static-deferred` feature)."
+        );
     };
 }

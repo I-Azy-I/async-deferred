@@ -37,7 +37,9 @@ pub enum Error {
     /// The task panicked. Contains the panic message.
     #[cfg(feature = "alloc")]
     Panicked(String),
-    /// The runtime dropped the task before it finished, for example on shutdown.
+    /// The runtime dropped the task before it finished, for example on shutdown. For
+    /// [`StaticDeferred::join`](crate::StaticDeferred::join), also returned when the run
+    /// it waited for was cancelled.
     Cancelled,
 }
 

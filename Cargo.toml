@@ -18,7 +18,7 @@ exclude = ["embassy-esp32s3", "embassy-esp32s3-no-heap"]
 default = ["std", "tokio"]
 # `Deferred`, which allocates its tasks on the heap.
 alloc = ["dep:futures-channel", "dep:futures-util"]
-std = ["alloc", "futures-util?/std", "critical-section?/std"]
+std = ["alloc", "futures-util?/std"]
 tokio = ["std", "dep:tokio"]
 smol = ["std", "dep:smol"]
 # `StaticDeferred`, which needs no heap.
@@ -39,6 +39,7 @@ futures-util = "0.3"
 proptest = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tokio-test = "0.4"
+trybuild = "1"
 
 [package.metadata.docs.rs]
 all-features = true

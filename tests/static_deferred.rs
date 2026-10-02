@@ -362,3 +362,93 @@ fn debug_shows_the_state() {
         "StaticDeferred { state: NotStarted, .. }"
     );
 }
+
+/// Counts how often a waker made from it is woken.
+struct WakeCount(std::sync::atomic::AtomicUsize);
+
+impl WakeCount {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self(std::sync::atomic::AtomicUsize::new(0)))
+    }
+
+    fn get(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl futures_util::task::ArcWake for WakeCount {
+    fn wake_by_ref(arc_self: &std::sync::Arc<Self>) {
+        arc_self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// `cancel` must wake a waiting `join`, even if the task never runs again.
+#[test]
+fn cancel_wakes_a_waiting_join() {
+    let deferred = StaticDeferred::<u32>::new();
+    let ticket = deferred.begin().unwrap(); // never spawned
+    let wakes = WakeCount::new();
+    let waker = futures_util::task::waker(wakes.clone());
+    let mut cx = Context::from_waker(&waker);
+
+    let mut join = std::pin::pin!(deferred.join());
+    assert!(join.as_mut().poll(&mut cx).is_pending());
+    assert!(deferred.cancel());
+    assert!(wakes.get() > 0, "the waiting join was not woken");
+    assert_eq!(
+        join.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::Cancelled))
+    );
+    drop(ticket);
+}
+
+/// A `join` waiting for one run must not return the result of a later run.
+#[test]
+fn join_is_tied_to_its_run() {
+    let deferred = StaticDeferred::<u32>::new();
+    let mut executor = Executor::new(2);
+    let mut cx = Context::from_waker(noop_waker_ref());
+    executor
+        .spawn(deferred.begin().unwrap(), std::future::pending())
+        .unwrap();
+    executor.run();
+
+    let mut join = std::pin::pin!(deferred.join());
+    assert!(join.as_mut().poll(&mut cx).is_pending());
+
+    // Cancel and start the next run before the waiting `join` is polled again.
+    assert!(deferred.cancel());
+    executor
+        .spawn(deferred.begin().unwrap(), async { 2 })
+        .unwrap();
+    executor.run();
+
+    assert_eq!(
+        join.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::Cancelled))
+    );
+    // The later run's result is still there for whoever started it.
+    assert_eq!(deferred.take(), Some(2));
+}
+
+/// If another task takes the result first, a waiting `join` reports it as taken.
+#[test]
+fn join_after_the_result_was_taken_elsewhere() {
+    let deferred = StaticDeferred::<u32>::new();
+    let mut executor = Executor::new(1);
+    let mut cx = Context::from_waker(noop_waker_ref());
+    let (tx, rx) = oneshot::channel();
+    executor
+        .spawn(deferred.begin().unwrap(), async { rx.await.unwrap() })
+        .unwrap();
+
+    let mut join = std::pin::pin!(deferred.join());
+    assert!(join.as_mut().poll(&mut cx).is_pending());
+    tx.send(7).unwrap();
+    executor.run();
+    assert_eq!(deferred.take(), Some(7));
+    assert_eq!(
+        join.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::NotStarted))
+    );
+}

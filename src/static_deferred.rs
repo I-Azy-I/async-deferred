@@ -17,7 +17,11 @@ use crate::{BeginError, Error, State};
 /// [`Ticket`]. All methods take `&self`, so the `static` can be used from anywhere.
 ///
 /// Needs a [`critical-section`](https://docs.rs/critical-section) implementation, which
-/// embassy and the HALs provide. Panics in the job are not caught.
+/// embassy and the HALs provide. With `std`, add
+/// `critical-section = { version = "1", features = ["std"] }` to your own dependencies.
+///
+/// Panics in the job are not caught. On targets where a panic unwinds instead of halting,
+/// such as `std`, the `StaticDeferred` then reports [`State::Cancelled`].
 ///
 /// Wait on it ([`join`](Self::join) or [`cancel_and_wait`](Self::cancel_and_wait)) from one
 /// task at a time. Several waiting tasks still all finish, but they keep waking each other
@@ -55,7 +59,7 @@ struct Shared<T> {
     /// Increases with every `begin`, so a task from an earlier run can't affect this one.
     run: u32,
     /// Tickets and running tasks that still exist, from this run or earlier ones.
-    live: u16,
+    live: u32,
     /// The task of the current run, woken when it is cancelled.
     task: Option<Waker>,
     /// Whoever waits in `join` or `cancel_and_wait`.
@@ -179,7 +183,8 @@ impl<T> StaticDeferred<T> {
 
     /// Calls `f` with the result if the run has finished, without moving it out.
     ///
-    /// `f` runs inside a critical section, so keep it short.
+    /// `f` runs inside a critical section, so keep it short, and don't use this
+    /// `StaticDeferred` from `f`: that panics because it is already borrowed.
     pub fn with_result<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
         self.with(|shared| match &shared.phase {
             Phase::Done(value) => Some(f(value)),
@@ -189,12 +194,23 @@ impl<T> StaticDeferred<T> {
 
     /// Waits for the run to finish and moves its result out.
     ///
-    /// Returns [`Error::NotStarted`] if no run is in progress and no result is waiting, and
-    /// [`Error::Cancelled`] if the task was dropped before it finished.
+    /// Returns [`Error::NotStarted`] if no run is in progress and no result is waiting, or if
+    /// another task took the result first. Returns [`Error::Cancelled`] if the run was
+    /// cancelled or its task was dropped before it finished. A `join` only waits for the run
+    /// that was in progress when it started, never for a later one.
     pub async fn join(&self) -> Result<T, Error> {
+        // The run this `join` waits for, once it has seen one in progress.
+        let mut waiting_for = None;
         poll_fn(|cx| {
             let (poll, to_wake) = self.with(|shared| match shared.phase {
-                Phase::Pending => (Poll::Pending, register(&mut shared.waiter, cx.waker())),
+                // `cancel` moves to a new run number, so a change means it was cancelled.
+                _ if waiting_for.map_or(false, |run| run != shared.run) => {
+                    (Poll::Ready(Err(Error::Cancelled)), None)
+                }
+                Phase::Pending => {
+                    waiting_for = Some(shared.run);
+                    (Poll::Pending, register(&mut shared.waiter, cx.waker()))
+                }
                 Phase::NotStarted => (Poll::Ready(Err(Error::NotStarted)), None),
                 Phase::Cancelled => (Poll::Ready(Err(Error::Cancelled)), None),
                 Phase::Done(_) => match mem::replace(&mut shared.phase, Phase::NotStarted) {
@@ -215,15 +231,18 @@ impl<T> StaticDeferred<T> {
     /// [`cancel_and_wait`](Self::cancel_and_wait) to wait until it has stopped.
     /// Returns `false` and does nothing if no run is in progress.
     pub fn cancel(&self) -> bool {
-        let (cancelled, task) = self.with(|shared| {
+        let (cancelled, task, waiter) = self.with(|shared| {
             if matches!(shared.phase, Phase::Pending) {
                 shared.phase = Phase::NotStarted;
-                (true, shared.task.take())
+                // A new run number tells the task and any waiting `join` that this run ended.
+                shared.run = shared.run.wrapping_add(1);
+                (true, shared.task.take(), shared.waiter.take())
             } else {
-                (false, None)
+                (false, None, None)
             }
         });
         wake(task);
+        wake(waiter);
         cancelled
     }
 
@@ -232,7 +251,9 @@ impl<T> StaticDeferred<T> {
     ///
     /// On a single-threaded executor such as embassy, their task pool slots are free when
     /// this returns. It waits for every ticket from [`begin`](Self::begin) to be run or
-    /// dropped, so don't start a new run from elsewhere while waiting.
+    /// dropped, so don't start a new run from elsewhere while waiting. A ticket that is
+    /// neither run nor dropped, for example passed to [`mem::forget`], makes this wait
+    /// forever.
     /// Returns `true` if a run was in progress.
     pub async fn cancel_and_wait(&self) -> bool {
         let cancelled = self.cancel();

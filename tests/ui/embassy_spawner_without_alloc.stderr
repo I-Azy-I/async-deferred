@@ -1,0 +1,7 @@
+error: `embassy_spawner!` needs the `alloc` feature of async-deferred, because `Deferred` keeps its tasks on the heap. Without a heap, use `StaticDeferred` (the `static-deferred` feature).
+ --> tests/ui/embassy_spawner_without_alloc.rs:1:1
+  |
+1 | async_deferred::embassy_spawner!(DeferredSpawner, pool_size = 4);
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `async_deferred::embassy_spawner` (in Nightly builds, run with -Z macro-backtrace for more info)
