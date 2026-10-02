@@ -1,785 +1,579 @@
-use std::sync::Arc;
+#![doc = include_str!("../README.md")]
+#![cfg_attr(not(feature = "std"), no_std)]
 
-use tokio::sync::OnceCell;
-use tokio::task::JoinHandle;
-use std::future::Future;
+extern crate alloc;
 
-/// Represents the current state of an asynchronous task.
-#[derive(Debug, Clone, PartialEq, Eq)]
+mod spawner;
+
+use alloc::string::String;
+use core::fmt;
+use core::future::Future;
+
+use futures_channel::oneshot;
+use futures_util::future::{AbortHandle, Abortable};
+
+#[cfg(feature = "smol")]
+pub use spawner::Smol;
+#[cfg(feature = "tokio")]
+pub use spawner::Tokio;
+pub use spawner::{LocalSpawner, Spawner};
+
+/// What the task sends back: the value and the callback's panic message, or the task's
+/// panic message.
+type Outcome<T> = Result<(T, Option<String>), String>;
+
+/// The state of a [`Deferred`] task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    /// The task hasn't been started yet.
-    NotInitialized,
-    /// The task is currently running.
+    /// No task has been started, or its result was taken.
+    NotStarted,
+    /// The task is running.
     Pending,
-    /// The task has completed successfully and returned a value.
+    /// The task finished and its result is available.
     Completed,
-    /// The task panicked during execution.
-    TaskPanicked(String),
-    /// The callback panicked during execution.
-    CallbackPanicked(String),
-
+    /// The task panicked. See [`Deferred::panic_message`].
+    ///
+    /// Only reported with the `std` feature; without it, a panic is not caught.
+    TaskPanicked,
+    /// The task finished but its callback panicked. The result is still available.
+    /// See [`Deferred::panic_message`].
+    ///
+    /// Only reported with the `std` feature; without it, a panic is not caught.
+    CallbackPanicked,
+    /// The runtime dropped the task before it finished, for example on shutdown.
+    Cancelled,
 }
 
-/// A handle to an asynchronous computation that allows for deferred result retrieval.
-/// 
-/// This struct supports the "fire-and-forget" pattern with the ability to later query the result
-/// or detect if the task panicked. It's useful when you want to start a computation but don't
-/// need the result immediately.
+/// Why [`Deferred::join`] has no result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Error {
+    /// No task has been started, or its result was taken.
+    NotStarted,
+    /// The task panicked. Contains the panic message.
+    Panicked(String),
+    /// The runtime dropped the task before it finished, for example on shutdown.
+    Cancelled,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::NotStarted => f.write_str("no task has been started"),
+            Error::Panicked(msg) => write!(f, "task panicked: {msg}"),
+            Error::Cancelled => f.write_str("task was cancelled"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for Error {}
+
+#[derive(Debug)]
+enum Inner<T> {
+    NotStarted,
+    Running {
+        receiver: oneshot::Receiver<Outcome<T>>,
+        abort: AbortHandle,
+    },
+    Done {
+        value: T,
+        callback_panic: Option<String>,
+    },
+    Panicked(String),
+    Cancelled,
+}
+
+/// A background task whose result you can check or collect later.
+///
+/// Tasks run on any async runtime through a [`Spawner`]. With the default `tokio`
+/// feature, [`start`](Self::start) and [`begin`](Self::begin) spawn on the current
+/// Tokio runtime.
+///
+/// The result is kept until you [`take`](Self::take) it or drop the `Deferred`.
+/// Dropping a `Deferred` does not stop its task; use [`cancel`](Self::cancel) for that.
 ///
 /// # Examples
 ///
 /// ```rust
 /// use async_deferred::Deferred;
-/// 
-/// # tokio_test::block_on(async {
-/// // Start a computation immediately
-/// let mut deferred = Deferred::start(|| async {
-///     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-///     42
-/// });
 ///
-/// // Later, get the result
-/// let result = deferred.join().await.try_get();
-/// assert_eq!(result, Some(&42));
+/// # tokio_test::block_on(async {
+/// let mut deferred = Deferred::start(async { 42 });
+///
+/// // ... do other work ...
+///
+/// assert_eq!(deferred.join().await, Ok(&42));
 /// # })
 /// ```
-///
-/// ```
-/// // Create and start manually
-///  use async_deferred::Deferred;
-/// 
-/// # tokio_test::block_on(async {
-/// let mut deferred = Deferred::new();
-/// deferred.begin(|| async { "Hello, World!" });
-///
-/// // Check if ready without blocking (might not be ready yet)
-/// match deferred.try_get() {
-///     Some(result) => println!("Result: {}", result),
-///     None => println!("Not ready yet"),
-/// }
-/// # })
-/// ```
-///
-/// # Thread Safety
-///
-/// `Deferred<T>` is `Send` and `Sync` when `T` is `Send` and `Sync`, making it safe to
-/// share across threads and async tasks.
-///
-/// # Memory Management
-///
-/// Internally, the task runs on Tokio's async runtime, and the result is stored in a `OnceCell`.
-/// The computation runs independently and the result is cached until retrieved via `take()` or
-/// the `Deferred` is dropped.
 #[derive(Debug)]
 pub struct Deferred<T> {
-    value: Arc<OnceCell<T>>,
-    task_handle: Option<JoinHandle<()>>,
-    panic_message: Option<String>,
-    is_callback_panic: bool,
+    inner: Inner<T>,
 }
 
-impl<T> Deferred<T>
-where
-    T: Send + Sync + 'static,
-{
-    /// Creates a new empty `Deferred` instance.
-    ///
-    /// The task must be started manually using [`begin`](Self::begin) or [`begin_with_callback`](Self::begin_with_callback).
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use async_deferred::Deferred;
-    /// 
-    /// # tokio_test::block_on(async {
-    /// let mut deferred = Deferred::new();
-    /// assert!(deferred.is_not_initialized());
-    /// 
-    /// deferred.begin(|| async { 42 });
-    /// assert!(!deferred.is_not_initialized());
-    /// # })
-    /// ```
+impl<T> Deferred<T> {
+    /// Creates a `Deferred` with no task. Start one with [`begin_on`](Self::begin_on).
     pub fn new() -> Self {
         Self {
-            value: Arc::new(OnceCell::new()),
-            task_handle: None,
-            panic_message: None,
-            is_callback_panic: false
+            inner: Inner::NotStarted,
         }
     }
 
-    /// Starts a new asynchronous task and returns a `Deferred` handle.
+    /// Spawns `future` with `spawner` and returns its `Deferred`.
     ///
-    /// This is a convenient way to construct and start the deferred task in one step.
-    ///
-    /// # Arguments
-    /// * `computation` - An async function or closure that returns the result of the task.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use async_deferred::Deferred;
-    /// 
-    /// # tokio_test::block_on(async {
-    /// let deferred = Deferred::start(|| async {
-    ///     // Some computation
-    ///     42
-    /// });
-    /// 
-    /// // Task is already running
-    /// assert!(deferred.is_pending() || deferred.is_ready());
-    /// # })
-    /// ```
-    pub fn start<F, Fut>(computation: F) -> Self
-    where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = T> + Send + 'static,
-    {
-        let mut deferred = Self::new();
-        deferred.begin(computation);
-        deferred
-    }
-
-    /// Starts a new asynchronous task with a callback that is called once the task completes.
-    ///
-    /// The callback is executed after the computation finishes, regardless of whether it
-    /// succeeded or panicked. This is useful for logging, cleanup, or notifications.
-    ///
-    /// # Arguments
-    /// * `computation` - An async function or closure that returns the result of the task.
-    /// * `callback` - A closure that will be run after the task completes.
-    ///
-    /// # Examples
-    ///
-    /// ```rust 
-    /// use async_deferred::Deferred;
-    /// # tokio_test::block_on(async {
-    /// let deferred = Deferred::start_with_callback(
-    ///     || async { 42 },
-    ///     || println!("Computation finished!")
-    /// );
-    /// # })
-    /// ```
-    pub fn start_with_callback<F, C, Fut>(computation: F, callback: C) -> Self
-    where
-        F: FnOnce() -> Fut + Send + 'static,
-        C: FnOnce() + Send + 'static,
-        Fut: Future<Output = T> + Send + 'static,
-    {
-        let mut deferred = Self::new();
-        deferred.begin_with_callback(computation, callback);
-        deferred
-    }
-    
-    /// Begins execution of the deferred task.
-    ///
-    /// Returns `true` if the task was successfully started, or `false` if it has already 
-    /// been started or completed.
-    ///
-    /// # Arguments
-    /// * `computation` - An async function or closure that returns the result of the task.
-    ///
-    /// # Examples
+    /// See [`Spawner`] for using your own runtime.
     ///
     /// ```rust
     /// use async_deferred::Deferred;
-    /// # tokio_test::block_on(async {
-    /// let mut deferred = Deferred::new();
-    /// 
-    /// assert!(deferred.begin(|| async { 42 })); // Started successfully
-    /// assert!(!deferred.begin(|| async { 24 })); // Already started, returns false
-    /// 
-    /// # })
+    ///
+    /// // Start a task from outside a Tokio runtime
+    /// let runtime = tokio::runtime::Runtime::new().unwrap();
+    /// let mut deferred = Deferred::start_on(runtime.handle(), async { 42 });
+    /// assert_eq!(runtime.block_on(deferred.join()), Ok(&42));
     /// ```
-    pub fn begin<F, Fut>(&mut self, computation: F) -> bool
+    pub fn start_on<S, F>(spawner: &S, future: F) -> Self
     where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = T> + Send + 'static,
+        S: Spawner,
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
     {
-        self._begin(computation, None::<fn()>)
+        let mut deferred = Self::new();
+        deferred.begin_on(spawner, future);
+        deferred
     }
 
-    /// Begins execution of the deferred task and executes a callback after completion.
+    /// Like [`start_on`](Self::start_on), and runs `callback` with the result once
+    /// `future` finishes.
     ///
-    /// Returns `true` if the task was successfully started, or `false` if it has already
-    /// been started or completed.
-    ///
-    /// # Arguments
-    /// * `computation` - An async function or closure that returns the result of the task.
-    /// * `callback` - A closure that will be run after the task completes.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use async_deferred::Deferred;
-    /// 
-    /// # tokio_test::block_on(async {
-    /// let mut deferred = Deferred::new();
-    /// 
-    /// let started = deferred.begin_with_callback(
-    ///     || async { 42 },
-    ///     || println!("Task completed!")
-    /// );
-    /// assert!(started);
-    /// # })
-    /// ```
-    pub fn begin_with_callback<F, C, Fut>(&mut self, computation: F, callback: C) -> bool
+    /// The callback is not run if `future` panics.
+    pub fn start_with_callback_on<S, F, C>(spawner: &S, future: F, callback: C) -> Self
     where
-        F: FnOnce() -> Fut + Send + 'static,
-        C: FnOnce() + Send + 'static,
-        Fut: Future<Output = T> + Send + 'static,
+        S: Spawner,
+        F: Future<Output = T> + Send + 'static,
+        C: FnOnce(&T) + Send + 'static,
+        T: Send + 'static,
     {
-        self._begin(computation, Some(callback))
+        let mut deferred = Self::new();
+        deferred.begin_with_callback_on(spawner, future, callback);
+        deferred
     }
 
-    /// Internal implementation for starting tasks with optional callbacks.
-    fn _begin<F, C, Fut>(&mut self, computation: F, callback: Option<C>) -> bool
+    /// Spawns `future` with `spawner`.
+    ///
+    /// Returns `false` and does nothing if a task was already started and its result
+    /// has not been taken.
+    pub fn begin_on<S, F>(&mut self, spawner: &S, future: F) -> bool
     where
-        F: FnOnce() -> Fut + Send + 'static,
-        C: FnOnce() + Send + 'static,
-        Fut: Future<Output = T> + Send + 'static,
+        S: Spawner,
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
     {
-        if !self.is_not_initialized() {
+        self.begin_with_callback_on(spawner, future, |_: &T| {})
+    }
+
+    /// Like [`begin_on`](Self::begin_on), and runs `callback` with the result once
+    /// `future` finishes.
+    ///
+    /// The callback is not run if `future` panics.
+    pub fn begin_with_callback_on<S, F, C>(&mut self, spawner: &S, future: F, callback: C) -> bool
+    where
+        S: Spawner,
+        F: Future<Output = T> + Send + 'static,
+        C: FnOnce(&T) + Send + 'static,
+        T: Send + 'static,
+    {
+        if !self.is_not_started() {
             return false;
         }
-
-        let cell = self.value.clone();
-
-        let handle = tokio::spawn(async move {
-            let result = computation().await;
-            let _ = cell.set(result);
-            if let Some(callback) = callback {
-                callback();
-            }
-        });
-
-        self.task_handle = Some(handle);
+        let (task, running) = task(future, callback);
+        spawner.spawn(task);
+        self.inner = running;
         true
     }
 
-    /// Returns the current state of the task.
-    ///
-    /// # Returns
-    /// - `State::NotInitialized` - The task hasn't been started yet
-    /// - `State::Pending` - The task is currently running
-    /// - `State::Completed` - The task completed successfully or the callback panicked
-    /// - `State::TaskPanicked` - The task panicked during execution
-    /// 
-    /// [`state`](Self::state) only detects if the task has panicked and not the callback.
-    /// If you need this information, use [`join`](Self::join) or [`state_async`](Self::state_async).
-    /// 
-    /// # Examples
-    ///
-    /// ```rust
-    /// use async_deferred::{Deferred, State};
-    /// 
-    /// # tokio_test::block_on(async {
-    /// let mut deferred: Deferred<u32> = Deferred::new();
-    /// assert!(matches!(deferred.state(), State::NotInitialized));
-    /// deferred.begin(|| async { 
-    ///     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    ///     42
-    /// });
-    /// assert!(matches!(deferred.state(), State::Pending));
-    /// tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    /// assert!(matches!(deferred.state(), State::Completed));
-    /// # })
-    /// ```
-    /// If panicked due to the callback, [`state`](Self::state) will return State::Completed.
-    /// ```rust
-    /// use async_deferred::{Deferred, State};
-    /// 
-    /// # tokio_test::block_on(async {
-    /// let mut deferred: Deferred<u32> = Deferred::start_with_callback(
-    ///         || async {42},
-    ///         || {panic!("the callback panicked");},
-    /// );
-    /// tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    /// 
-    /// // state only detects if the task has panicked and not the callback
-    /// assert!(matches!(deferred.state(), State::Completed));
-    /// # })
-    /// ```
-   pub fn state(&self) -> State {
-        // If we already detected a panic, return the appropriate state
-        if let Some(panic_msg) = &self.panic_message {
-            return if self.is_callback_panic {
-                State::CallbackPanicked(panic_msg.clone())
-            } else {
-                State::TaskPanicked(panic_msg.clone())
-            };
-        }
-        
-        // Check if we have a task handle
-        if let Some(handle) = &self.task_handle {
-            if handle.is_finished() {
-                // Task is finished, but we can't check for panic synchronously
-                // We'll need to await the result in an async context
-                // For now, if the task is finished but we don't have a result, assume it panicked
-                if self.is_ready() {
-                    State::Completed
-                } else {
-                    // Task finished but no result - likely panicked
-                    // We'll set a default message until we can properly check
-                    State::TaskPanicked("Task may have panicked (use join() to get details)".to_string())
-                }
-            } else if self.is_ready() {
-                // Task is still running but result is available (shouldn't happen)
-                State::Completed
-            } else {
-                // Task is still running
-                State::Pending
-            }
-        } else if self.is_ready() {
-            // handle may be none if the handle has been consumed by the join
-            State::Completed
-        } else {
-            State::NotInitialized
-        }
+    /// Like [`start_on`](Self::start_on), for futures that are not `Send`.
+    pub fn start_local_on<S, F>(spawner: &S, future: F) -> Self
+    where
+        S: LocalSpawner,
+        F: Future<Output = T> + 'static,
+        T: 'static,
+    {
+        let mut deferred = Self::new();
+        deferred.begin_local_on(spawner, future);
+        deferred
     }
 
-   
-    /// Returns the current state of the task. This method is able to correctly 
-    /// diagnose when a given callback panics, as opposed to [`state`](Self::state).
-    /// Though asynchronous, it will not block until the task completes.
-    ///
-    /// # Returns
-    /// - `State::NotInitialized` - The task hasn't been started yet
-    /// - `State::Pending` - The task is currently running
-    /// - `State::Completed` - The task completed successfully
-    /// - `State::TaskPanicked` - The task panicked during execution
-    /// - `State::CallbackPanicked` - The callback panicked during execution
-    /// 
-    /// # Examples
-    /// ```rust
-    /// use async_deferred::{Deferred, State};
-    /// 
-    /// # tokio_test::block_on(async {
-    /// let mut deferred: Deferred<u32> = Deferred::new();
-    /// assert!(matches!(deferred.state_async().await, State::NotInitialized));
-    /// deferred.begin(|| async { 
-    ///     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    ///     42
-    /// });
-    /// 
-    /// // The task is not done yet
-    /// assert!(matches!(deferred.state_async().await, State::Pending));
-    /// 
-    /// tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    /// 
-    /// // The task is completed
-    /// assert!(matches!(deferred.state_async().await, State::Completed));
-    /// # })
-    /// ```
-    /// 
-    /// ```rust
-    /// use async_deferred::{Deferred, State};
-    /// 
-    /// # tokio_test::block_on(async {
-    /// let mut deferred: Deferred<u32> = Deferred::start_with_callback(
-    ///         || async { panic!("the task panicked"); 42 },
-    ///         || { panic!("callback will not be called since the task panicked"); },
-    /// );
-    /// tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    /// 
-    /// assert!(matches!(deferred.state_async().await, State::TaskPanicked(_)));
-    /// # })
-    /// ```
-    /// 
-    /// ```rust
-    /// use async_deferred::{Deferred, State};
-    /// 
-    /// # tokio_test::block_on(async {
-    /// let mut deferred: Deferred<u32> = Deferred::start_with_callback(
-    ///         || async { 42 },
-    ///         || { panic!("the callback panicked"); },
-    /// );
-    /// tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    /// 
-    /// assert!(matches!(deferred.state_async().await, State::CallbackPanicked(_)));
-    /// # })
-    pub async fn state_async(&mut self) -> State {
-        // If we already detected a panic, return the appropriate state
-        if let Some(panic_msg) = &self.panic_message {
-            return if self.is_callback_panic {
-                State::CallbackPanicked(panic_msg.clone())
-            } else {
-                State::TaskPanicked(panic_msg.clone())
-            };
-        }
-        
-        // Check if we have a task handle
-        if let Some(handle) = &self.task_handle {
-            if handle.is_finished() {
-                // We can safely await the finished task
-                self.join().await;
-                
-                // Now check the state again
-                if let Some(panic_msg) = &self.panic_message {
-                    if self.is_callback_panic {
-                        State::CallbackPanicked(panic_msg.clone())
-                    } else {
-                        State::TaskPanicked(panic_msg.clone())
-                    }
-                } else if self.is_ready() {
-                    State::Completed
-                } else {
-                    // This shouldn't happen
-                    State::Pending
-                }
-            } else if self.is_ready() {
-                State::Completed
-            } else {
-                State::Pending
-            }
-        } else {
-            State::NotInitialized
-        }
-    }
-    /// Attempts to retrieve the result of the computation if available.
-    ///
-    /// Returns `Some(&T)` if the task has completed successfully, or `None` if the task
-    /// is still pending, panicked, or not started.
-    ///
-    /// This is a non-blocking operation that returns immediately.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use async_deferred::Deferred;
-    /// # tokio_test::block_on(async {
-    /// let deferred = Deferred::start(|| async { 42 });
-    /// 
-    /// // Might return None if task hasn't finished yet
-    /// if let Some(result) = deferred.try_get() {
-    ///     println!("Result: {}", result);
-    /// }
-    /// # })
-    /// ```
-    pub fn try_get(&self) -> Option<&T> {
-        self.value.get()
+    /// Like [`start_with_callback_on`](Self::start_with_callback_on), for futures that
+    /// are not `Send`.
+    pub fn start_with_callback_local_on<S, F, C>(spawner: &S, future: F, callback: C) -> Self
+    where
+        S: LocalSpawner,
+        F: Future<Output = T> + 'static,
+        C: FnOnce(&T) + 'static,
+        T: 'static,
+    {
+        let mut deferred = Self::new();
+        deferred.begin_with_callback_local_on(spawner, future, callback);
+        deferred
     }
 
-    /// Waits for the task to complete and returns a reference to self.
-    ///
-    /// If the task is still pending, this will await its completion (either success or panic).
-    /// If the task has already completed or panicked, this returns immediately.
-    ///
-    /// This method allows for method chaining: `deferred.join().await.try_get()`.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use async_deferred::Deferred;
-    /// 
-    /// # tokio_test::block_on(async {
-    /// let mut deferred = Deferred::start(|| async {
-    ///     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    ///     42
-    /// });
-    ///
-    /// // Wait for completion and get result
-    /// let result = deferred.join().await.try_get();
-    /// assert_eq!(result, Some(&42));
-    /// # })
-    /// ```
-    pub async fn join(&mut self) -> &Self {
-        if let Some(handle) = std::mem::take(&mut self.task_handle) {
-            let result = handle.await;
-            match result {
-                Ok(_) => {
-                    // Task completed successfully
-                },
-                Err(join_err) => {
-                    // Check if it's a callback panic and extract message
-                    let (panic_msg, is_callback_panic) = if join_err.is_panic() {
-                        if let Ok(panic_payload) = join_err.try_into_panic() {
-                            let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                                format!("Panic message: {}", s)
-                            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                                format!("Panic message: {}", s)
-                            } else {
-                                "Panic occurred, but couldn't get the message.".to_string()
-                            };
-                            
-                            (panic_msg, self.is_ready())
-                        } else {
-                            ("Panic occurred, but couldn't extract panic info.".to_string(), false)
-                        }
-                    } else if join_err.is_cancelled() {
-                        ("Task was cancelled.".to_string(), false)
-                    } else {
-                        ("Unknown join error.".to_string(), false)
-                    };
-                    
-                    self.panic_message = Some(panic_msg);
-                    self.is_callback_panic = is_callback_panic;
-                }
-            }
-        }
-        self
+    /// Like [`begin_on`](Self::begin_on), for futures that are not `Send`.
+    pub fn begin_local_on<S, F>(&mut self, spawner: &S, future: F) -> bool
+    where
+        S: LocalSpawner,
+        F: Future<Output = T> + 'static,
+        T: 'static,
+    {
+        self.begin_with_callback_local_on(spawner, future, |_: &T| {})
     }
 
-    /// Cancels the current task if it's pending.
-    /// 
-    /// If the task is not pending (completed, panicked, or not initialized), 
-    /// this method does nothing and returns `false`. Returns `true` if the 
-    /// task was successfully cancelled.
-    ///
-    /// After cancellation, the `Deferred` returns to the `NotInitialized` state
-    /// and can be reused with a new task via `begin()` or `begin_with_callback()`.
-    /// 
-    /// # Returns
-    /// - `true` if a pending task was cancelled
-    /// - `false` if there was no pending task to cancel
-    /// 
-    /// # Examples
-    /// 
-    /// ```rust
-    /// use async_deferred::{Deferred, State};
-    /// 
-    /// # tokio_test::block_on(async {
-    /// let mut deferred = Deferred::start(|| async { 
-    ///     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-    ///     42 
-    /// });
-    /// 
-    /// let was_cancelled = deferred.cancel();
-    /// assert!(was_cancelled);
-    /// assert_eq!(deferred.state(), State::NotInitialized);
-    /// 
-    /// // Can reuse the deferred after cancellation
-    /// deferred.begin(|| async { 100 });
-    /// assert!(deferred.is_pending());
-    /// # })
-    /// ```
-    /// 
-    /// ```rust
-    /// use async_deferred::{Deferred, State};
-    /// 
-    /// # tokio_test::block_on(async {
-    /// // Task completes quickly
-    /// let mut deferred = Deferred::start(|| async { 42 });
-    /// tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    /// 
-    /// // Try to cancel after completion - does nothing
-    /// let was_cancelled = deferred.cancel();
-    /// assert!(!was_cancelled);
-    /// assert_eq!(deferred.state(), State::Completed);
-    /// assert_eq!(deferred.take(), Some(42));
-    /// # })
-    /// ```
-    /// 
-    /// ```rust
-    /// use async_deferred::{Deferred, State};
-    /// 
-    /// # tokio_test::block_on(async {
-    /// // Not initialized yet
-    /// let mut deferred: Deferred<i32> = Deferred::new();
-    /// 
-    /// // Try to cancel uninitialized task - does nothing
-    /// let was_cancelled = deferred.cancel();
-    /// assert!(!was_cancelled);
-    /// assert_eq!(deferred.state(), State::NotInitialized);
-    /// # })
-    /// ```
-    pub fn cancel(&mut self) -> bool{
-        if self.is_pending() {
-        if let Some(handle) = &self.task_handle {
-            handle.abort();
+    /// Like [`begin_with_callback_on`](Self::begin_with_callback_on), for futures that
+    /// are not `Send`.
+    pub fn begin_with_callback_local_on<S, F, C>(
+        &mut self,
+        spawner: &S,
+        future: F,
+        callback: C,
+    ) -> bool
+    where
+        S: LocalSpawner,
+        F: Future<Output = T> + 'static,
+        C: FnOnce(&T) + 'static,
+        T: 'static,
+    {
+        if !self.is_not_started() {
+            return false;
         }
-        // Reset to uninitialized state
-        self.task_handle = None;
-        self.value = Arc::new(OnceCell::new());
-        self.panic_message = None;
-        self.is_callback_panic = false;
+        let (task, running) = task(future, callback);
+        spawner.spawn_local(task);
+        self.inner = running;
         true
-    } else {
-        false
-    }
     }
 
-    /// Attempts to take ownership of the computed value.
+    /// If the task has finished, stores its outcome. Never waits.
+    fn poll_task(&mut self) {
+        let Inner::Running { receiver, .. } = &mut self.inner else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(None) => {}
+            Ok(Some(outcome)) => self.inner = Inner::finished(Some(outcome)),
+            Err(oneshot::Canceled) => self.inner = Inner::finished(None),
+        }
+    }
+
+    /// Waits for the task to finish and returns its result.
     ///
-    /// Returns `Some(T)` if the task has completed successfully, consuming the stored result.
-    /// Returns `None` if the task is still pending, panicked, or not started.
-    ///
-    /// After calling this method successfully, subsequent calls will return `None` since
-    /// the value has been moved out.
-    ///
-    /// # Examples
+    /// Returns immediately if the task already finished. If the task finished but its
+    /// callback panicked, the result is still returned; check [`state`](Self::state)
+    /// to detect that.
     ///
     /// ```rust
-    /// use async_deferred::Deferred;
-    /// 
+    /// use async_deferred::{Deferred, Error};
+    ///
     /// # tokio_test::block_on(async {
-    /// let mut deferred = Deferred::start(|| async { vec![1, 2, 3] });
-    /// 
-    /// // Wait for completion
-    /// deferred.join().await;
-    ///
-    /// // Take ownership of the result
-    /// let result = deferred.take();
-    /// assert_eq!(result, Some(vec![1, 2, 3]));
-    ///
-    /// // Subsequent calls return None
-    /// assert_eq!(deferred.take(), None);
+    /// let mut deferred: Deferred<u32> = Deferred::start(async { panic!("boom") });
+    /// assert_eq!(deferred.join().await, Err(Error::Panicked("boom".into())));
     /// # })
     /// ```
-    /// 
-    /// [`take`](Self::take) will not consume if it is still pending
+    pub async fn join(&mut self) -> Result<&T, Error> {
+        if let Inner::Running { receiver, .. } = &mut self.inner {
+            let outcome = receiver.await.ok();
+            self.inner = Inner::finished(outcome);
+        }
+        match &self.inner {
+            Inner::Done { value, .. } => Ok(value),
+            Inner::Panicked(msg) => Err(Error::Panicked(msg.clone())),
+            Inner::Cancelled => Err(Error::Cancelled),
+            Inner::NotStarted => Err(Error::NotStarted),
+            Inner::Running { .. } => unreachable!("the task was awaited above"),
+        }
+    }
+
+    /// Returns the current [`State`] without waiting.
+    pub fn state(&mut self) -> State {
+        self.poll_task();
+        match &self.inner {
+            Inner::NotStarted => State::NotStarted,
+            Inner::Running { .. } => State::Pending,
+            Inner::Done {
+                callback_panic: None,
+                ..
+            } => State::Completed,
+            Inner::Done {
+                callback_panic: Some(_),
+                ..
+            } => State::CallbackPanicked,
+            Inner::Panicked(_) => State::TaskPanicked,
+            Inner::Cancelled => State::Cancelled,
+        }
+    }
+
+    /// Returns the panic message if the task or its callback panicked.
+    pub fn panic_message(&mut self) -> Option<&str> {
+        self.poll_task();
+        match &self.inner {
+            Inner::Panicked(msg)
+            | Inner::Done {
+                callback_panic: Some(msg),
+                ..
+            } => Some(msg),
+            _ => None,
+        }
+    }
+
+    /// Returns the result if the task has finished, without waiting.
+    pub fn try_get(&mut self) -> Option<&T> {
+        self.poll_task();
+        match &self.inner {
+            Inner::Done { value, .. } => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Moves the result out if the task has finished, without waiting.
+    ///
+    /// On success, the `Deferred` is reset and can start a new task.
+    ///
     /// ```rust
-    /// use async_deferred::Deferred;
-    /// 
+    /// use async_deferred::{Deferred, State};
+    ///
     /// # tokio_test::block_on(async {
-    /// let mut deferred = Deferred::start(|| async { 
-    ///     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    ///     42
-    /// });
-    /// // If still pending, doesn't consume it
-    /// assert_eq!(deferred.take(), None);
-    /// tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    /// assert!(matches!(deferred.try_get(), Some(42)));
+    /// let mut deferred = Deferred::start(async { vec![1, 2, 3] });
+    /// deferred.join().await.unwrap();
+    /// assert_eq!(deferred.take(), Some(vec![1, 2, 3]));
+    /// assert_eq!(deferred.state(), State::NotStarted);
     /// # })
     /// ```
-    /// 
     pub fn take(&mut self) -> Option<T> {
-        if self.is_ready() {
-            let value = std::mem::take(&mut self.value);
-            self.task_handle = None;
-            Arc::try_unwrap(value).ok()?.into_inner()
-        } else {
-            None
+        self.poll_task();
+        if !matches!(self.inner, Inner::Done { .. }) {
+            return None;
+        }
+        match core::mem::replace(&mut self.inner, Inner::NotStarted) {
+            Inner::Done { value, .. } => Some(value),
+            _ => unreachable!("checked above"),
         }
     }
 
-
-    /// Returns `true` if the task panicked during execution.
+    /// Stops a running task and resets the `Deferred` so it can start a new one.
     ///
-    /// A task is considered panicked if it was started but the `JoinHandle` indicates
-    /// it finished without storing a result in the `OnceCell`.
-    ///
-    /// # Examples
+    /// The task stops the next time the runtime polls it.
+    /// Returns `false` and does nothing if no task is running.
     ///
     /// ```rust
-    /// use async_deferred::Deferred;
-    /// 
+    /// use async_deferred::{Deferred, State};
+    ///
     /// # tokio_test::block_on(async {
-    /// let mut deferred = Deferred::start(|| async {
-    ///     panic!("Something went wrong!");
-    /// });
-    /// 
-    /// tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    /// 
-    /// assert!(deferred.has_task_panicked());
+    /// let mut deferred = Deferred::start(std::future::pending::<u32>());
+    /// assert!(deferred.cancel());
+    /// assert_eq!(deferred.state(), State::NotStarted);
     /// # })
     /// ```
-    pub fn has_task_panicked(&self) -> bool {
-       matches!(self.state(), State::TaskPanicked(_))
+    pub fn cancel(&mut self) -> bool {
+        self.poll_task();
+        let Inner::Running { abort, .. } = &self.inner else {
+            return false;
+        };
+        abort.abort();
+        self.inner = Inner::NotStarted;
+        true
     }
 
-
-    /// Returns `true` if the data is available.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use async_deferred::Deferred;
-    /// 
-    /// # tokio_test::block_on(async {
-    /// let mut deferred = Deferred::start(|| async { 
-    ///     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    ///     42 
-    /// });
-    /// 
-    /// // Initially not ready
-    /// assert!(!deferred.is_ready());
-    ///
-    /// deferred.join().await;
-    /// assert!(deferred.is_ready());
-    /// # })
-    /// ```
-    pub fn is_ready(&self) -> bool {
-        self.value.get().is_some()
+    /// Returns `true` if the result is available, even if the callback panicked.
+    pub fn is_ready(&mut self) -> bool {
+        self.try_get().is_some()
     }
 
-    /// Returns `true` if the task has completed successfully.
-    ///
-    /// This means the computation finished without panicking and a result is available
-    /// via [`try_get`](Self::try_get) or [`take`](Self::take).
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use async_deferred::Deferred;
-    /// 
-    /// # tokio_test::block_on(async {
-    /// let mut deferred = Deferred::start(|| async { 
-    ///     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    ///     42 
-    /// });
-    /// 
-    /// // Initially not ready
-    /// assert!(!deferred.is_complete());
-    ///
-    /// deferred.join().await;
-    /// println!("{:?}", deferred.state());
-    /// assert!(deferred.is_complete());
-    /// # })
-    pub fn is_complete(&self) -> bool {
-        matches!(self.state(), State::Completed)
+    /// Returns `true` if the task and its callback finished without panicking.
+    pub fn is_complete(&mut self) -> bool {
+        self.state() == State::Completed
     }
 
-    /// Returns `true` if the task is currently running.
-    ///
-    /// A task is pending if it has been started but hasn't completed or panicked yet.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use async_deferred::Deferred;
-    /// # tokio_test::block_on(async {
-    /// let deferred = Deferred::start(|| async {
-    ///     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    ///     42
-    /// });
-    ///
-    /// assert!(deferred.is_pending()); // Task is running
-    /// # })
-    /// ```
-    pub fn is_pending(&self) -> bool {
-        matches!(self.state(), State::Pending)
+    /// Returns `true` if the task is still running.
+    pub fn is_pending(&mut self) -> bool {
+        self.state() == State::Pending
     }
 
-    /// Returns `true` if the task hasn't been initialized yet.
-    ///
-    /// This is the initial state of a `Deferred` created with [`new`](Self::new).
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use async_deferred::Deferred;
-    /// # tokio_test::block_on(async {
-    /// let deferred: Deferred<i32> = Deferred::new();
-    /// assert!(deferred.is_not_initialized());
-    ///
-    /// let started_deferred = Deferred::start(|| async { 42 });
-    /// assert!(!started_deferred.is_not_initialized());
-    /// # })
-    /// ```
-    pub fn is_not_initialized(&self) -> bool {
-        matches!(self.state(), State::NotInitialized)
+    /// Returns `true` if no task has been started, or its result was taken.
+    pub fn is_not_started(&mut self) -> bool {
+        self.state() == State::NotStarted
+    }
+
+    /// Returns `true` if the task panicked.
+    pub fn has_task_panicked(&mut self) -> bool {
+        self.state() == State::TaskPanicked
     }
 }
 
-impl<T> Default for Deferred<T>
-where
-    T: Send + Sync + 'static,
-{
-    /// Creates a new empty `Deferred` instance.
+#[cfg(feature = "tokio")]
+impl<T> Deferred<T> {
+    /// Spawns `future` on the current Tokio runtime and returns its `Deferred`.
     ///
-    /// Equivalent to [`Deferred::new()`](Self::new).
+    /// # Panics
+    ///
+    /// Panics if called outside a Tokio runtime. Use [`start_on`](Self::start_on) with a
+    /// [`tokio::runtime::Handle`] there.
+    pub fn start<F>(future: F) -> Self
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        Self::start_on(&Tokio, future)
+    }
+
+    /// Like [`start`](Self::start), and runs `callback` with the result once `future` finishes.
+    ///
+    /// The callback is not run if `future` panics.
+    ///
+    /// ```rust
+    /// use async_deferred::Deferred;
+    ///
+    /// # tokio_test::block_on(async {
+    /// let deferred = Deferred::start_with_callback(
+    ///     async { 42 },
+    ///     |result| println!("computed {result}"),
+    /// );
+    /// # })
+    /// ```
+    pub fn start_with_callback<F, C>(future: F, callback: C) -> Self
+    where
+        F: Future<Output = T> + Send + 'static,
+        C: FnOnce(&T) + Send + 'static,
+        T: Send + 'static,
+    {
+        Self::start_with_callback_on(&Tokio, future, callback)
+    }
+
+    /// Spawns `future` on the current Tokio runtime.
+    ///
+    /// Returns `false` and does nothing if a task was already started and its result
+    /// has not been taken.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a Tokio runtime.
+    ///
+    /// ```rust
+    /// use async_deferred::Deferred;
+    ///
+    /// # tokio_test::block_on(async {
+    /// let mut deferred = Deferred::new();
+    /// assert!(deferred.begin(async { 42 }));
+    /// assert!(!deferred.begin(async { 24 }));
+    /// # })
+    /// ```
+    pub fn begin<F>(&mut self, future: F) -> bool
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.begin_on(&Tokio, future)
+    }
+
+    /// Like [`begin`](Self::begin), and runs `callback` with the result once `future` finishes.
+    ///
+    /// The callback is not run if `future` panics.
+    pub fn begin_with_callback<F, C>(&mut self, future: F, callback: C) -> bool
+    where
+        F: Future<Output = T> + Send + 'static,
+        C: FnOnce(&T) + Send + 'static,
+        T: Send + 'static,
+    {
+        self.begin_with_callback_on(&Tokio, future, callback)
+    }
+}
+
+impl<T> Default for Deferred<T> {
+    /// Same as [`Deferred::new`].
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<T> Inner<T> {
+    /// `None` means the task was dropped before sending its outcome.
+    fn finished(outcome: Option<Outcome<T>>) -> Self {
+        match outcome {
+            Some(Ok((value, callback_panic))) => Inner::Done {
+                value,
+                callback_panic,
+            },
+            Some(Err(msg)) => Inner::Panicked(msg),
+            None => Inner::Cancelled,
+        }
+    }
+}
+
+/// Builds the task to spawn, and the `Running` state that tracks it.
+///
+/// The task is `Send` whenever `F`, `C` and `T` are.
+fn task<T, F, C>(future: F, callback: C) -> (impl Future<Output = ()>, Inner<T>)
+where
+    F: Future<Output = T> + 'static,
+    C: FnOnce(&T) + 'static,
+    T: 'static,
+{
+    let (sender, receiver) = oneshot::channel();
+    let (abort, abort_registration) = AbortHandle::new_pair();
+    let task = Abortable::new(
+        async move {
+            let outcome = match catch_unwind(future).await {
+                Ok(value) => {
+                    // Catch a callback panic so the computed value is not lost with it.
+                    let callback_panic = call_catching_panic(callback, &value).err();
+                    Ok((value, callback_panic))
+                }
+                Err(msg) => Err(msg),
+            };
+            // The `Deferred` may have been dropped; the result is then discarded.
+            let _ = sender.send(outcome);
+        },
+        abort_registration,
+    );
+    let task = async move {
+        let _ = task.await;
+    };
+    (task, Inner::Running { receiver, abort })
+}
+
+/// Awaits `future`, turning a panic into its message.
+#[cfg(feature = "std")]
+async fn catch_unwind<F: Future>(future: F) -> Result<F::Output, String> {
+    use futures_util::FutureExt;
+    std::panic::AssertUnwindSafe(future)
+        .catch_unwind()
+        .await
+        .map_err(|payload| panic_message(&*payload))
+}
+
+/// Awaits `future`. Without `std`, panics cannot be caught.
+#[cfg(not(feature = "std"))]
+async fn catch_unwind<F: Future>(future: F) -> Result<F::Output, String> {
+    Ok(future.await)
+}
+
+/// Calls `callback`, turning a panic into its message.
+#[cfg(feature = "std")]
+fn call_catching_panic<T, C: FnOnce(&T)>(callback: C, value: &T) -> Result<(), String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(value)))
+        .map_err(|payload| panic_message(&*payload))
+}
+
+/// Calls `callback`. Without `std`, panics cannot be caught.
+#[cfg(not(feature = "std"))]
+fn call_catching_panic<T, C: FnOnce(&T)>(callback: C, value: &T) -> Result<(), String> {
+    callback(value);
+    Ok(())
+}
+
+/// Extracts a readable message from a panic payload.
+#[cfg(feature = "std")]
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
     }
 }
