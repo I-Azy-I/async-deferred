@@ -33,6 +33,8 @@
   `static StaticDeferred` and its own task, which runs the job through the `Ticket` that
   `begin` returns. It needs a `critical-section` implementation: embassy and the HALs
   provide one, and `std` programs add `critical-section` with its `std` feature.
+  It also works on chips without atomic compare-and-swap, such as Cortex-M0 or the
+  ESP32-C3, where `Deferred` reports a compile error pointing to it.
 - `rust-version = "1.68"`, checked in CI.
 - `cancel_and_wait` cancels the task and waits until its future has been dropped. On a
   single-threaded executor such as embassy, its task pool slot is free when it returns.

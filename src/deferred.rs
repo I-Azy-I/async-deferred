@@ -378,6 +378,10 @@ impl<T> Deferred<T> {
     /// Cancelling is cooperative: the task stops at its next `.await`. Code that blocks
     /// without awaiting keeps running until it reaches one.
     ///
+    /// If the task finishes just as `cancel` runs, its result is discarded and `cancel`
+    /// still returns `true`. To keep a result that has already arrived, call
+    /// [`take`](Self::take) first.
+    ///
     /// ```rust
     /// use async_deferred::{Deferred, State};
     ///

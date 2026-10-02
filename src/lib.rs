@@ -6,7 +6,15 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
-#[cfg(feature = "alloc")]
+// `Deferred` uses atomic compare-and-swap, through `Arc` and the `futures` channels.
+#[cfg(all(feature = "alloc", not(target_has_atomic = "ptr")))]
+compile_error!(
+    "`Deferred` (the `alloc` feature of async-deferred) needs atomic compare-and-swap, which \
+     this target does not have (for example Cortex-M0 or ESP32-C3). Use `StaticDeferred` \
+     instead: disable `alloc` and enable the `static-deferred` feature."
+);
+
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
 mod deferred;
 mod embassy;
 mod error;
@@ -20,7 +28,7 @@ pub mod __private {
     pub use alloc::boxed::Box;
 }
 
-#[cfg(feature = "alloc")]
+#[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
 pub use deferred::{Deferred, IntoResult};
 pub use error::{BeginError, Error, SpawnError, State};

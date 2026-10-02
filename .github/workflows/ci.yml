@@ -90,9 +90,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - riscv32imac-unknown-none-elf # e.g. ESP32-C6
-          - thumbv7em-none-eabihf # e.g. STM32F4, nRF52
+        include:
+          # Targets with atomic compare-and-swap support both modes.
+          - target: riscv32imac-unknown-none-elf # e.g. ESP32-C6
+            cas: true
+          - target: thumbv7em-none-eabihf # e.g. STM32F4, nRF52
+            cas: true
+          # Without it, only `StaticDeferred` works.
+          - target: riscv32imc-unknown-none-elf # e.g. ESP32-C3
+            cas: false
+          - target: thumbv6m-none-eabi # e.g. RP2040
+            cas: false
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -101,7 +109,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Deferred (alloc)
+        if: matrix.cas
         run: cargo build --no-default-features --features alloc --target ${{ matrix.target }}
+
+      - name: Deferred reports a clear error
+        if: ${{ !matrix.cas }}
+        run: |
+          if cargo build --no-default-features --features alloc --target ${{ matrix.target }} 2> build.log; then
+            echo "expected the build to fail without atomic compare-and-swap"
+            exit 1
+          fi
+          grep -q "needs atomic compare-and-swap" build.log
 
       - name: StaticDeferred (no heap)
         run: cargo build --no-default-features --features static-deferred --target ${{ matrix.target }}

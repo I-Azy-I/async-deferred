@@ -25,7 +25,9 @@ use crate::{BeginError, Error, State};
 ///
 /// Wait on it ([`join`](Self::join) or [`cancel_and_wait`](Self::cancel_and_wait)) from one
 /// task at a time. Several waiting tasks still all finish, but they keep waking each other
-/// until then, which costs CPU time.
+/// until then, which costs CPU time, and a `join` that ends without a result may report
+/// [`Error::Cancelled`] where [`Error::NotStarted`] would be accurate. A `join` that returns
+/// `Ok` always has the result of the run it waited for.
 ///
 /// # Examples
 ///
@@ -214,7 +216,11 @@ impl<T> StaticDeferred<T> {
     /// Returns [`Error::NotStarted`] if no run is in progress and no result is waiting, or if
     /// another task took the result first. Returns [`Error::Cancelled`] if the run was
     /// cancelled or its task was dropped before it finished. A `join` only waits for the run
-    /// that was in progress when it started, never for a later one.
+    /// that was in progress when it started, never for a later one. A [`Ticket`] dropped
+    /// without running counts as a dropped task.
+    ///
+    /// With several tasks waiting at once, the error kind may be `Cancelled` where
+    /// `NotStarted` would be accurate; see the type's docs.
     pub async fn join(&self) -> Result<T, Error> {
         // The run this `join` waits for, once it has seen one in progress.
         let mut waiting_for = None;
@@ -372,17 +378,17 @@ impl<'a, T> Ticket<'a, T> {
         .await;
 
         if let Some(value) = output {
-            let (leftover, waiter) = running.deferred.with(move |shared| {
+            let (leftover, waiter, task) = running.deferred.with(move |shared| {
                 if shared.is_current(running.run) {
                     shared.phase = Phase::Done(value);
-                    shared.task = None;
-                    (None, shared.waiter.take())
+                    (None, shared.waiter.take(), shared.task.take())
                 } else {
                     // Cancelled while finishing: discard the value.
-                    (Some(value), None)
+                    (Some(value), None, None)
                 }
             });
-            drop(leftover);
+            // Dropped outside the critical section: their `Drop` may run any code.
+            drop((leftover, task));
             wake(waiter);
         }
     }
@@ -395,6 +401,8 @@ impl<T> Drop for Ticket<'_, T> {
             shared.live -= 1;
             if shared.is_current(self.run) {
                 shared.phase = Phase::NotStarted;
+                // Like `cancel`: a waiting `join` sees that this run ended without a result.
+                shared.run = shared.run.wrapping_add(1);
             }
             shared.waiter.take()
         });
@@ -410,14 +418,18 @@ struct Running<'a, T> {
 
 impl<T> Drop for Running<'_, T> {
     fn drop(&mut self) {
-        let waiter = self.deferred.with(|shared| {
+        let (waiter, task) = self.deferred.with(|shared| {
             shared.live -= 1;
-            if shared.is_current(self.run) {
+            let task = if shared.is_current(self.run) {
                 shared.phase = Phase::Cancelled;
-                shared.task = None;
-            }
-            shared.waiter.take()
+                shared.task.take()
+            } else {
+                None
+            };
+            (shared.waiter.take(), task)
         });
+        // Dropped outside the critical section: its `Drop` may run any code.
+        drop(task);
         wake(waiter);
     }
 }

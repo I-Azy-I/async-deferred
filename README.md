@@ -136,7 +136,7 @@ Tasks are started through a spawner, which hands them to an async runtime.
 | `tokio` (default) | `Tokio`, `tokio::runtime::Handle`, `tokio::task::LocalSet` (local) | Enables the `start` and `begin` shortcuts used above |
 | `smol` | `Smol`, `smol::Executor`, `smol::LocalExecutor` (local) | |
 | `std` (default) | | Catches panics in the task and callback. Without it, the crate is `no_std` |
-| `alloc` (with `std`) | | `Deferred`, which keeps its task on the heap |
+| `alloc` (with `std`) | | `Deferred`, which keeps its task on the heap. Needs atomic compare-and-swap |
 | `static-deferred` | | `StaticDeferred`, which needs no heap |
 
 To use another runtime without pulling in Tokio:
@@ -190,7 +190,8 @@ async-deferred = { version = "0.4", default-features = false, features = ["alloc
 ```
 
 `embassy_spawner!` declares a spawner for embassy in one line. You also need a heap allocator,
-such as `esp-alloc` or `embedded-alloc`, and a target with atomic compare-and-swap.
+such as `esp-alloc` or `embedded-alloc`, and a target with atomic compare-and-swap. On chips
+without it, such as Cortex-M0 (RP2040) or the ESP32-C3, use `StaticDeferred` below.
 
 ```rust,ignore
 use async_deferred::{embassy_spawner, Deferred};

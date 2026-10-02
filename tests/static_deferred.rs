@@ -514,3 +514,81 @@ fn join_after_take_then_a_later_run_is_cancelled() {
         Poll::Ready(Err(Error::NotStarted))
     );
 }
+
+/// A dropped ticket ends the run the same way, whether a new run begins first or not.
+#[test]
+fn join_after_the_ticket_is_dropped() {
+    let mut cx = Context::from_waker(noop_waker_ref());
+
+    let deferred = StaticDeferred::<u32>::new();
+    let ticket = deferred.begin().unwrap();
+    let mut join = std::pin::pin!(deferred.join());
+    assert!(join.as_mut().poll(&mut cx).is_pending());
+    drop(ticket);
+    assert_eq!(
+        join.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::Cancelled))
+    );
+
+    let deferred = StaticDeferred::<u32>::new();
+    let ticket = deferred.begin().unwrap();
+    let mut join = std::pin::pin!(deferred.join());
+    assert!(join.as_mut().poll(&mut cx).is_pending());
+    drop(ticket);
+    let _next = deferred.begin().unwrap();
+    assert_eq!(
+        join.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::Cancelled))
+    );
+}
+
+static REENTRANT: StaticDeferred<u32> = StaticDeferred::new();
+
+/// A waker that reads `REENTRANT` when its last copy is dropped.
+struct ReadsOnDrop;
+
+impl futures_util::task::ArcWake for ReadsOnDrop {
+    fn wake_by_ref(_: &std::sync::Arc<Self>) {}
+}
+
+impl Drop for ReadsOnDrop {
+    fn drop(&mut self) {
+        let _ = REENTRANT.state();
+    }
+}
+
+/// Wakers are dropped outside the critical section, so dropping one may use the
+/// `StaticDeferred` again.
+#[test]
+fn wakers_are_dropped_outside_the_critical_section() {
+    // The task is dropped while running.
+    let ticket = REENTRANT.begin().unwrap();
+    let mut task = Box::pin(ticket.run(std::future::pending()));
+    {
+        let waker = futures_util::task::waker(std::sync::Arc::new(ReadsOnDrop));
+        assert!(task
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+    }
+    drop(task);
+    assert_eq!(REENTRANT.state(), State::Cancelled);
+
+    // The task finishes.
+    let (tx, rx) = oneshot::channel();
+    let ticket = REENTRANT.begin().unwrap();
+    let mut task = Box::pin(ticket.run(async { rx.await.unwrap() }));
+    {
+        let waker = futures_util::task::waker(std::sync::Arc::new(ReadsOnDrop));
+        assert!(task
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+    }
+    tx.send(5).unwrap();
+    assert!(task
+        .as_mut()
+        .poll(&mut Context::from_waker(noop_waker_ref()))
+        .is_ready());
+    assert_eq!(REENTRANT.take(), Some(5));
+}
