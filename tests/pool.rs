@@ -126,3 +126,27 @@ fn errors_display() {
         "a task is running or its result has not been taken"
     );
 }
+
+/// A task can start another one while it runs; the new task gets its own slot.
+#[test]
+fn task_started_from_a_running_task_keeps_its_slot() {
+    let pool = SlotPool::new(2);
+    let inner: std::rc::Rc<std::cell::RefCell<Option<Deferred<u32>>>> = Default::default();
+    let (tx, rx) = oneshot::channel::<()>();
+    let (spawner, started) = (pool.clone(), inner.clone());
+    let mut outer = Deferred::start_local_on(&pool, async move {
+        *started.borrow_mut() = Some(Deferred::start_local_on(&spawner, async { 7 }).unwrap());
+        rx.await.unwrap();
+        1
+    })
+    .unwrap();
+
+    pool.run_once();
+    let mut inner = inner
+        .borrow_mut()
+        .take()
+        .expect("the outer task started one");
+    assert_eq!(pool.run_until(inner.join()), Ok(&7));
+    tx.send(()).unwrap();
+    assert_eq!(pool.run_until(outer.join()), Ok(&1));
+}

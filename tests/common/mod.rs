@@ -145,21 +145,34 @@ impl<T> Drop for Tracked<T> {
 /// cancelled with `cancel()` keeps its slot until the executor runs again.
 #[derive(Clone)]
 pub struct SlotPool {
-    slots: std::rc::Rc<std::cell::RefCell<Vec<Option<LocalTask>>>>,
+    slots: std::rc::Rc<std::cell::RefCell<Vec<Slot>>>,
 }
 
 type LocalTask = std::pin::Pin<Box<dyn Future<Output = ()>>>;
 
+enum Slot {
+    Free,
+    /// Holds a task, or `None` while that task is being polled, so a task it spawns meanwhile
+    /// can't take its slot.
+    Used(Option<LocalTask>),
+}
+
 impl SlotPool {
     pub fn new(slots: usize) -> Self {
         Self {
-            slots: std::rc::Rc::new(std::cell::RefCell::new((0..slots).map(|_| None).collect())),
+            slots: std::rc::Rc::new(std::cell::RefCell::new(
+                (0..slots).map(|_| Slot::Free).collect(),
+            )),
         }
     }
 
     /// How many slots hold a task.
     pub fn used(&self) -> usize {
-        self.slots.borrow().iter().filter(|t| t.is_some()).count()
+        self.slots
+            .borrow()
+            .iter()
+            .filter(|slot| matches!(slot, Slot::Used(_)))
+            .count()
     }
 
     /// Polls every task once, freeing the slots of finished tasks.
@@ -167,11 +180,18 @@ impl SlotPool {
         let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
         let count = self.slots.borrow().len();
         for i in 0..count {
-            let task = self.slots.borrow_mut()[i].take();
+            // Take the task out while polling it; the slot stays used.
+            let task = match &mut self.slots.borrow_mut()[i] {
+                Slot::Used(task) => task.take(),
+                Slot::Free => None,
+            };
             if let Some(mut task) = task {
-                if task.as_mut().poll(&mut cx).is_pending() {
-                    self.slots.borrow_mut()[i] = Some(task);
-                }
+                let pending = task.as_mut().poll(&mut cx).is_pending();
+                self.slots.borrow_mut()[i] = if pending {
+                    Slot::Used(Some(task))
+                } else {
+                    Slot::Free
+                };
             }
         }
     }
@@ -198,9 +218,9 @@ impl LocalSpawner for SlotPool {
         let mut slots = self.slots.borrow_mut();
         let free = slots
             .iter_mut()
-            .find(|slot| slot.is_none())
+            .find(|slot| matches!(slot, Slot::Free))
             .ok_or(SpawnError::new("all slots are used"))?;
-        *free = Some(Box::pin(task));
+        *free = Slot::Used(Some(Box::pin(task)));
         Ok(())
     }
 }
