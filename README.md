@@ -228,4 +228,4 @@ A complete example for the ESP32-S3, with tests that run on the chip, is in
 
 ## License
 
-Licensed under the [MIT license](LICENSE).
+Licensed under the [MIT license](https://github.com/I-Azy-I/async-deferred/blob/main/LICENSE).
