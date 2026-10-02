@@ -11,9 +11,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Once;
-use std::task::{Context, Waker};
+use std::task::{Context, Poll};
 
-use async_deferred::{Deferred, Error, LocalSpawner, State};
+use async_deferred::{BeginError, Deferred, Error, LocalSpawner, SpawnError, State};
 use futures_channel::oneshot;
 use futures_util::FutureExt;
 use proptest::prelude::*;
@@ -30,6 +30,8 @@ enum Callback {
 #[derive(Debug, Clone)]
 enum Op {
     Begin(Callback),
+    /// `begin`, while the runtime refuses new tasks (e.g. its pool is full).
+    BeginRefused(Callback),
     /// The running task returns this value.
     Finish(u32),
     /// The running task panics.
@@ -37,11 +39,14 @@ enum Op {
     /// The runtime drops the running task, like on shutdown.
     RuntimeDrop,
     Cancel,
+    CancelAndWait,
     Take,
     TryGet,
     State,
     Join,
     PanicMessage,
+    /// Consumes the `Deferred` with `into_result`, then continues with a new one.
+    IntoResult,
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -51,16 +56,19 @@ fn op() -> impl Strategy<Value = Op> {
         Just(Callback::Panics)
     ];
     prop_oneof![
-        3 => callback.prop_map(Op::Begin),
+        3 => callback.clone().prop_map(Op::Begin),
+        1 => callback.prop_map(Op::BeginRefused),
         3 => any::<u32>().prop_map(Op::Finish),
         1 => Just(Op::Panic),
         1 => Just(Op::RuntimeDrop),
         2 => Just(Op::Cancel),
+        2 => Just(Op::CancelAndWait),
         2 => Just(Op::Take),
         1 => Just(Op::TryGet),
         1 => Just(Op::State),
         2 => Just(Op::Join),
         1 => Just(Op::PanicMessage),
+        1 => Just(Op::IntoResult),
     ]
 }
 
@@ -76,6 +84,11 @@ enum Model {
 }
 
 impl Model {
+    /// A new task can start unless one is running or a result is waiting to be taken.
+    fn can_begin(&self) -> bool {
+        matches!(self, Model::NotStarted | Model::Panicked | Model::Cancelled)
+    }
+
     fn state(&self) -> State {
         match self {
             Model::NotStarted => State::NotStarted,
@@ -125,6 +138,7 @@ impl Model {
 
 const TASK_PANIC: &str = "task boom";
 const CALLBACK_PANIC: &str = "callback boom";
+const REFUSED: SpawnError = SpawnError::new("refused");
 
 // --- the manual executor ---
 
@@ -132,38 +146,50 @@ type Task = Pin<Box<dyn Future<Output = ()>>>;
 
 /// Holds spawned tasks; the test polls or drops them explicitly.
 #[derive(Clone, Default)]
-struct Manual(Rc<RefCell<Vec<Option<Task>>>>);
+struct Manual {
+    tasks: Rc<RefCell<Vec<Option<Task>>>>,
+    /// When set, spawning fails, like a runtime whose task pool is full.
+    refuse: Rc<Cell<bool>>,
+}
 
 impl LocalSpawner for Manual {
-    fn spawn_local<F>(&self, task: F)
+    fn spawn_local<F>(&self, task: F) -> Result<(), SpawnError>
     where
         F: Future<Output = ()> + 'static,
     {
-        self.0.borrow_mut().push(Some(Box::pin(task)));
+        if self.refuse.get() {
+            return Err(REFUSED);
+        }
+        self.tasks.borrow_mut().push(Some(Box::pin(task)));
+        Ok(())
     }
 }
 
 impl Manual {
     /// Polls every unfinished task once.
     fn run(&self) {
-        let mut cx = Context::from_waker(Waker::noop());
-        let count = self.0.borrow().len();
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        let count = self.tasks.borrow().len();
         for i in 0..count {
-            let task = self.0.borrow_mut()[i].take();
+            let task = self.tasks.borrow_mut()[i].take();
             if let Some(mut task) = task {
                 if task.as_mut().poll(&mut cx).is_pending() {
-                    self.0.borrow_mut()[i] = Some(task);
+                    self.tasks.borrow_mut()[i] = Some(task);
                 }
             }
         }
     }
 
     fn last_index(&self) -> usize {
-        self.0.borrow().len() - 1
+        self.tasks.borrow().len() - 1
+    }
+
+    fn is_finished(&self, index: usize) -> bool {
+        self.tasks.borrow()[index].is_none()
     }
 
     fn drop_task(&self, index: usize) {
-        self.0.borrow_mut()[index] = None;
+        self.tasks.borrow_mut()[index] = None;
     }
 }
 
@@ -201,7 +227,9 @@ fn run_ops(ops: &[Op]) -> Result<(), TestCaseError> {
 
     for op in ops {
         match op {
-            Op::Begin(callback) => {
+            Op::Begin(callback) | Op::BeginRefused(callback) => {
+                let refused = matches!(op, Op::BeginRefused(_));
+                executor.refuse.set(refused);
                 let (action_tx, action_rx) = oneshot::channel();
                 let task = controlled_task(action_rx);
                 let started = match callback {
@@ -218,8 +246,16 @@ fn run_ops(ops: &[Op]) -> Result<(), TestCaseError> {
                         })
                     }
                 };
-                prop_assert_eq!(started, model == Model::NotStarted, "begin");
-                if started {
+                executor.refuse.set(false);
+                let expected = if !model.can_begin() {
+                    Err(BeginError::AlreadyStarted)
+                } else if refused {
+                    Err(BeginError::Spawn(REFUSED))
+                } else {
+                    Ok(())
+                };
+                prop_assert_eq!(started, expected, "begin");
+                if started.is_ok() {
                     model = Model::Running(*callback);
                     running = Some(Running {
                         index: executor.last_index(),
@@ -267,6 +303,29 @@ fn run_ops(ops: &[Op]) -> Result<(), TestCaseError> {
                     executor.run(); // let the aborted task stop
                 }
             }
+            Op::CancelAndWait => {
+                let was_running = running.as_ref().map(|task| task.index);
+                let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+                let mut wait = std::pin::pin!(deferred.cancel_and_wait());
+                let mut result = wait.as_mut().poll(&mut cx);
+                if result.is_pending() {
+                    executor.run(); // the aborted task stops
+                    result = wait.as_mut().poll(&mut cx);
+                }
+                prop_assert_eq!(
+                    result,
+                    Poll::Ready(was_running.is_some()),
+                    "cancel_and_wait"
+                );
+                if let Some(index) = was_running {
+                    prop_assert!(
+                        executor.is_finished(index),
+                        "task still running after cancel_and_wait"
+                    );
+                    running = None;
+                    model = Model::NotStarted;
+                }
+            }
             Op::Take => {
                 let taken = deferred.take();
                 prop_assert_eq!(taken, model.value(), "take");
@@ -288,6 +347,21 @@ fn run_ops(ops: &[Op]) -> Result<(), TestCaseError> {
                     prop_assert_eq!(joined, Some(model.join()), "join");
                 }
             }
+            Op::IntoResult => {
+                let owned = std::mem::take(&mut deferred);
+                let mut future = owned.into_result();
+                let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+                let polled = Pin::new(&mut future).poll(&mut cx);
+                if matches!(model, Model::Running(_)) {
+                    prop_assert!(polled.is_pending(), "into_result should wait");
+                    // Dropping the future leaves the task running on its own.
+                    drop(future);
+                    running = None;
+                } else {
+                    prop_assert_eq!(polled, Poll::Ready(model.join()), "into_result");
+                }
+                model = Model::NotStarted;
+            }
             Op::PanicMessage => {
                 prop_assert_eq!(
                     deferred.panic_message(),
@@ -296,6 +370,11 @@ fn run_ops(ops: &[Op]) -> Result<(), TestCaseError> {
                 );
             }
         }
+
+        // The flag read through `&self` must agree with the channel, read through `&mut`.
+        let observed = deferred.state();
+        let _ = deferred.panic_message(); // receives the outcome if there is one
+        prop_assert_eq!(observed, deferred.state(), "flag vs channel after {:?}", op);
 
         // After every operation, all queries must agree with the model.
         prop_assert_eq!(deferred.state(), model.state(), "state after {:?}", op);
@@ -358,13 +437,28 @@ fn every_state_is_reached() {
         Op::Take,
         Op::Begin(Callback::None),
         Op::Cancel,
+        Op::BeginRefused(Callback::None),
+        Op::State,
+        Op::Begin(Callback::Runs),
+        Op::CancelAndWait,
         Op::Begin(Callback::None),
         Op::Panic,
         Op::PanicMessage,
         Op::Join,
+        Op::IntoResult,
+        Op::Begin(Callback::None),
+        Op::IntoResult,
+        Op::Begin(Callback::None),
+        Op::Finish(3),
+        Op::IntoResult,
     ];
     run_ops(&ops).unwrap();
 
-    let ops = [Op::Begin(Callback::None), Op::RuntimeDrop, Op::Join];
+    let ops = [
+        Op::Begin(Callback::None),
+        Op::RuntimeDrop,
+        Op::Join,
+        Op::IntoResult,
+    ];
     run_ops(&ops).unwrap();
 }

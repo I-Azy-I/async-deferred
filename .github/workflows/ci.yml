@@ -34,8 +34,11 @@ jobs:
         run: cargo test --all-features
 
       # Doctests need the default features, so only the test targets run here.
-      - name: No default features (no_std)
-        run: cargo test --no-default-features --tests
+      - name: Deferred without std (no_std + alloc)
+        run: cargo test --no-default-features --features alloc --tests
+
+      - name: StaticDeferred only (no heap)
+        run: cargo test --no-default-features --features static-deferred --tests
 
       - name: std only, without a runtime
         run: cargo test --no-default-features --features std --tests
@@ -56,13 +59,30 @@ jobs:
       - name: Clippy (all features)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Clippy (no default features)
-        run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - name: Clippy (no_std + alloc)
+        run: cargo clippy --all-targets --no-default-features --features alloc -- -D warnings
+
+      - name: Clippy (no heap)
+        run: cargo clippy --all-targets --no-default-features --features static-deferred -- -D warnings
 
       - name: Docs
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
+
+  docs-rs:
+    name: docs.rs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+
+      # Same settings as docs.rs, which labels each item with the features it needs.
+      - name: Docs as on docs.rs
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
 
   no-std:
     name: no_std (${{ matrix.target }})
@@ -70,9 +90,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - riscv32imac-unknown-none-elf # e.g. ESP32-C6
-          - thumbv7em-none-eabihf # e.g. STM32F4, nRF52
+        include:
+          # Targets with atomic compare-and-swap support both modes.
+          - target: riscv32imac-unknown-none-elf # e.g. ESP32-C6
+            cas: true
+          - target: thumbv7em-none-eabihf # e.g. STM32F4, nRF52
+            cas: true
+          # Without it, only `StaticDeferred` works.
+          - target: riscv32imc-unknown-none-elf # e.g. ESP32-C3
+            cas: false
+          - target: thumbv6m-none-eabi # e.g. RP2040
+            cas: false
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -80,5 +108,44 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build
-        run: cargo build --no-default-features --target ${{ matrix.target }}
+      - name: Deferred (alloc)
+        if: matrix.cas
+        run: cargo build --no-default-features --features alloc --target ${{ matrix.target }}
+
+      - name: Deferred reports a clear error
+        if: ${{ !matrix.cas }}
+        run: |
+          if cargo check --no-default-features --features alloc --target ${{ matrix.target }} 2> build.log; then
+            echo "expected the build to fail without atomic compare-and-swap"
+            exit 1
+          fi
+          grep -q "needs atomic compare-and-swap" build.log
+
+      - name: StaticDeferred (no heap)
+        run: cargo build --no-default-features --features static-deferred --target ${{ matrix.target }}
+
+  msrv:
+    name: MSRV (1.68)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.68
+
+      # Pick the newest dependency versions that still support Rust 1.68.
+      - name: Lock dependencies for Rust 1.68
+        run: |
+          cargo +stable generate-lockfile
+          # Cargo 1.68 only reads lockfile version 3.
+          sed -i 's/^version = 4$/version = 3/' Cargo.lock
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+
+      - name: All features
+        run: cargo +1.68 check --lib --all-features
+
+      - name: Deferred without std (no_std + alloc)
+        run: cargo +1.68 check --lib --no-default-features --features alloc
+
+      - name: StaticDeferred only (no heap)
+        run: cargo +1.68 check --lib --no-default-features --features static-deferred

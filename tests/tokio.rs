@@ -3,7 +3,7 @@
 
 mod common;
 
-use async_deferred::{Deferred, Error, State, Tokio};
+use async_deferred::{BeginError, Deferred, Error, SpawnError, State, Tokio};
 use common::{pending_until_dropped, Flag};
 use tokio::sync::oneshot;
 
@@ -37,8 +37,8 @@ async fn start_with_callback() {
 #[tokio::test]
 async fn begin() {
     let mut deferred = Deferred::new();
-    assert!(deferred.begin(async { 42 }));
-    assert!(!deferred.begin(async { 0 }));
+    assert_eq!(deferred.begin(async { 42 }), Ok(()));
+    assert_eq!(deferred.begin(async { 0 }), Err(BeginError::AlreadyStarted));
     assert_eq!(deferred.join().await, Ok(&42));
 }
 
@@ -47,15 +47,21 @@ async fn begin_with_callback() {
     let ran = Flag::default();
     let ran_in_callback = ran.clone();
     let mut deferred = Deferred::new();
-    assert!(deferred.begin_with_callback(async { 42 }, move |_| ran_in_callback.set()));
-    assert!(!deferred.begin_with_callback(async { 0 }, |_| {}));
+    assert_eq!(
+        deferred.begin_with_callback(async { 42 }, move |_| ran_in_callback.set()),
+        Ok(())
+    );
+    assert_eq!(
+        deferred.begin_with_callback(async { 0 }, |_| {}),
+        Err(BeginError::AlreadyStarted)
+    );
     deferred.join().await.unwrap();
     assert!(ran.is_set());
 }
 
 #[tokio::test]
 async fn start_on_tokio_spawner() {
-    let mut deferred = Deferred::start_on(&Tokio, async { 42 });
+    let mut deferred = Deferred::start_on(&Tokio, async { 42 }).unwrap();
     assert_eq!(deferred.join().await, Ok(&42));
 }
 
@@ -77,6 +83,18 @@ async fn cancel_stops_the_task() {
     assert_eq!(deferred.state(), State::NotStarted);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_and_wait_returns_after_the_task_stopped() {
+    for _ in 0..1000 {
+        let (future, mut dropped) = pending_until_dropped::<u32>();
+        let mut deferred = Deferred::start(future);
+        tokio::task::yield_now().await;
+        assert!(deferred.cancel_and_wait().await);
+        assert!(dropped.try_recv().is_err(), "the task was still running");
+        assert_eq!(deferred.state(), State::NotStarted);
+    }
+}
+
 #[tokio::test]
 async fn task_panic() {
     let mut deferred: Deferred<u32> = Deferred::start(async { panic!("boom") });
@@ -93,14 +111,14 @@ async fn callback_panic_keeps_value() {
 #[test]
 fn start_on_handle_from_outside_runtime() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let mut deferred = Deferred::start_on(runtime.handle(), async { 42 });
+    let mut deferred = Deferred::start_on(runtime.handle(), async { 42 }).unwrap();
     assert_eq!(runtime.block_on(deferred.join()), Ok(&42));
 }
 
 #[test]
 fn runtime_shutdown_reports_cancelled() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let mut deferred = Deferred::start_on(runtime.handle(), std::future::pending::<u32>());
+    let mut deferred = Deferred::start_on(runtime.handle(), std::future::pending::<u32>()).unwrap();
     drop(runtime);
     assert_eq!(deferred.state(), State::Cancelled);
     assert_eq!(
@@ -116,11 +134,53 @@ fn start_outside_runtime_panics() {
 }
 
 #[test]
-fn begin_outside_runtime_panics_and_stays_not_started() {
-    let mut deferred = Deferred::new();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        deferred.begin(async { 42 });
-    }));
+fn start_with_callback_outside_runtime_panics() {
+    let result = std::panic::catch_unwind(|| Deferred::start_with_callback(async { 42 }, |_| {}));
     assert!(result.is_err());
+}
+
+const NO_RUNTIME: SpawnError = SpawnError::new("not inside a Tokio runtime");
+
+#[test]
+fn start_on_tokio_outside_runtime_returns_error() {
+    assert_eq!(
+        Deferred::start_on(&Tokio, async { 42 }).err(),
+        Some(NO_RUNTIME)
+    );
+}
+
+#[test]
+fn begin_outside_runtime_returns_error_and_stays_not_started() {
+    let mut deferred = Deferred::new();
+    assert_eq!(
+        deferred.begin(async { 42 }),
+        Err(BeginError::Spawn(NO_RUNTIME))
+    );
+    assert_eq!(
+        deferred.begin_with_callback(async { 42 }, |_| {}),
+        Err(BeginError::Spawn(NO_RUNTIME))
+    );
     assert_eq!(deferred.state(), State::NotStarted);
+}
+
+#[tokio::test]
+async fn await_deferred_directly() {
+    let deferred = Deferred::start(async { String::from("done") });
+    assert_eq!(deferred.await, Ok(String::from("done")));
+}
+
+#[tokio::test]
+async fn local_set_runs_non_send_future() {
+    let local = tokio::task::LocalSet::new();
+    let shared = std::rc::Rc::new(41);
+    let deferred = Deferred::start_local_on(&local, async move { *shared + 1 }).unwrap();
+    assert_eq!(local.run_until(deferred.into_result()).await, Ok(42));
+}
+
+#[test]
+fn dropped_local_set_reports_cancelled() {
+    let local = tokio::task::LocalSet::new();
+    let deferred = Deferred::start_local_on(&local, std::future::pending::<u32>()).unwrap();
+    drop(local);
+    assert!(deferred.is_cancelled());
 }

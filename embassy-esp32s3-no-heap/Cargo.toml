@@ -1,17 +1,17 @@
 [package]
 edition      = "2024"
-name         = "embassy-esp32s3"
+name         = "embassy-esp32s3-no-heap"
 rust-version = "1.95"
 version      = "0.1.0"
 
 [[bin]]
-name = "embassy-esp32s3"
+name = "embassy-esp32s3-no-heap"
 path = "./src/bin/main.rs"
 test = false
 
 [[test]]
 harness = false
-name    = "deferred"
+name    = "static_deferred"
 
 [lib]
 test = false
@@ -19,22 +19,17 @@ test = false
 [dependencies]
 esp-hal = { version = "~1.2.2", features = ["defmt", "esp32s3", "unstable"] }
 
-esp-rtos = { version = "0.4.0", features = [
-  "defmt",
-  "embassy",
-  "esp-alloc",
-  "esp32s3",
-] }
+esp-rtos = { version = "0.4.0", features = ["defmt", "embassy", "esp32s3"] }
 
 defmt                  = "1.0.1"
 esp-bootloader-esp-idf = { version = "0.6.0", features = ["defmt", "esp32s3"] }
 
 embassy-executor = { version = "0.10.0", features = ["defmt"] }
 embassy-time     = { version = "0.5.0", features = ["defmt"] }
-esp-alloc        = { version = "0.11.0", features = ["defmt", "esp32s3"] }
 rtt-target       = { version = "0.6.2", features = ["defmt"] }
 
-async-deferred   = { path = "..", default-features = false, features = ["alloc"] }
+# No `alloc`: the firmware has no heap allocator.
+async-deferred   = { path = "..", default-features = false, features = ["static-deferred"] }
 critical-section = "1.2.0"
 static_cell      = "2.1.1"
 

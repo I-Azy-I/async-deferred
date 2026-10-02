@@ -1,7 +1,8 @@
 [package]
 name = "async-deferred"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
+rust-version = "1.68"
 authors = ["Azy"]
 description = "A lightweight utility for spawning async tasks with fire-and-forget semantics and deferred result retrieval."
 license = "MIT"
@@ -11,25 +12,35 @@ categories = ["asynchronous", "concurrency", "data-structures", "no-std", "embed
 keywords = ["async", "deferred", "task", "utility", "tokio"]
 documentation = "https://docs.rs/async-deferred"
 homepage = "https://github.com/I-Azy-I/async-deferred"
-exclude = ["embassy-esp32s3"]
+exclude = ["embassy-esp32s3", "embassy-esp32s3-no-heap"]
 
 [features]
 default = ["std", "tokio"]
-std = ["futures-util/std"]
+# `Deferred`, which allocates its tasks on the heap.
+alloc = ["dep:futures-channel", "dep:futures-util"]
+std = ["alloc", "futures-util?/std"]
 tokio = ["std", "dep:tokio"]
 smol = ["std", "dep:smol"]
+# `StaticDeferred`, which needs no heap.
+static-deferred = ["dep:critical-section"]
 
 [dependencies]
-futures-channel = { version = "0.3", default-features = false, features = ["alloc"] }
-futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+critical-section = { version = "1", optional = true }
+futures-channel = { version = "0.3", default-features = false, features = ["alloc"], optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"], optional = true }
 tokio = { version = "1", features = ["rt"], optional = true }
 smol = { version = "2", optional = true }
 
 [dev-dependencies]
+critical-section = { version = "1", features = ["std"] }
+futures-channel = "0.3"
 futures-executor = "0.3"
+futures-util = "0.3"
 proptest = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tokio-test = "0.4"
+trybuild = "1"
 
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

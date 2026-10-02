@@ -101,7 +101,10 @@ fn many_tasks_with_racing_operations() {
                         deferred.join().await.unwrap();
                         assert_eq!(deferred.take().unwrap().value, i);
                         let restarted = i + TASKS;
-                        assert!(deferred.begin(async move { restart_tracker.track(restarted) }));
+                        assert_eq!(
+                            deferred.begin(async move { restart_tracker.track(restarted) }),
+                            Ok(())
+                        );
                         assert_eq!(deferred.join().await.unwrap().value, restarted);
                     }
                 }
@@ -129,4 +132,34 @@ fn many_tasks_with_racing_operations() {
     eprintln!("cancel won {cancel_won} times, task won {task_won} times");
     assert!(cancel_won > 0 && task_won > 0);
     tracker.assert_all_dropped_once();
+}
+
+/// Another thread watches the state through `&Deferred` while the task finishes. Once it
+/// sees a finished state, the result must be there.
+#[test]
+fn observer_never_sees_finished_before_the_result() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .build()
+        .unwrap();
+    for i in 0..2_000u64 {
+        let mut deferred = Deferred::start_on(runtime.handle(), async move {
+            yield_times(i % 3).await;
+            i
+        })
+        .unwrap();
+        let seen = std::thread::scope(|scope| {
+            scope
+                .spawn(|| loop {
+                    match deferred.state() {
+                        State::Pending => std::hint::spin_loop(),
+                        state => return state,
+                    }
+                })
+                .join()
+                .unwrap()
+        });
+        assert_eq!(seen, State::Completed);
+        assert_eq!(deferred.take(), Some(i));
+    }
 }

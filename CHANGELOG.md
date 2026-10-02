@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.4.0
+
+### Breaking changes
+
+- `Spawner::spawn` and `LocalSpawner::spawn_local` return `Result<(), SpawnError>`, so a
+  runtime can refuse a task, for example when its task pool is full. Custom spawners return
+  `Ok(())` after handing the task to their runtime.
+- `start_on`, `start_with_callback_on`, `start_local_on` and
+  `start_with_callback_local_on` return `Result<Deferred<T>, SpawnError>`.
+- `begin`, `begin_on`, `begin_local_on` and their callback variants return
+  `Result<(), BeginError>` instead of `bool`: `BeginError::AlreadyStarted` replaces `false`,
+  and `BeginError::Spawn` reports a refused task.
+- `begin` can now start a new task after the previous one panicked or was dropped by the
+  runtime. Before, the `Deferred` stayed stuck in `TaskPanicked` or `Cancelled`.
+  `AlreadyStarted` now only means a task is running or its result has not been taken.
+- The `Tokio` spawner returns a `SpawnError` outside a Tokio runtime instead of panicking,
+  so `begin` and `begin_with_callback` return an error there. `start` and
+  `start_with_callback` still return `Deferred<T>` directly, and panic outside a runtime.
+- `embassy_spawner!` spawners return a `SpawnError` when all `pool_size` tasks are running,
+  instead of panicking.
+- `State`, `Error` and `BeginError` are `#[non_exhaustive]`: a `match` on them needs a
+  wildcard arm, so variants can be added later without a breaking change.
+- `Deferred` needs the new `alloc` feature, which `std` and so the default features
+  enable. Without the default features, use
+  `default-features = false, features = ["alloc"]` to keep `Deferred`.
+
+### Added
+
+- `StaticDeferred` and `Ticket`, behind the `static-deferred` feature: a task's result kept
+  in a `static`, for targets without a heap allocator. Each kind of job gets its own
+  `static StaticDeferred` and its own task, which runs the job through the `Ticket` that
+  `begin` returns. It needs a `critical-section` implementation: embassy and the HALs
+  provide one, and `std` programs add `critical-section` with its `std` feature.
+  It also works on chips without atomic compare-and-swap, such as Cortex-M0 or the
+  ESP32-C3, where `Deferred` reports a compile error pointing to it.
+- `rust-version = "1.68"`, checked in CI.
+- `cancel_and_wait` cancels the task and waits until its future has been dropped. On a
+  single-threaded executor such as embassy, its task pool slot is free when it returns.
+- `Spawner` is implemented for `&S`, `&mut S`, `Box<S>` and `Arc<S>`, and `LocalSpawner` also
+  for `Rc<S>`, where `S` is a spawner.
+- `into_result` and `.await` on a `Deferred` (it implements `IntoFuture`) wait for the task
+  and return the owned result: `Result<T, Error>`.
+- `has_callback_panicked` and `is_cancelled`, so every `State` has an `is_*` helper.
+- `state` and the `is_*` helpers take `&self` instead of `&mut self`, so the status can be
+  checked through a shared reference, for example from a `&self` method or another thread.
+  `try_get`, `take`, `join` and `panic_message` still take `&mut self`.
+- `LocalSpawner` for `tokio::task::LocalSet` and `smol::LocalExecutor`.
+- `Spawner` for any `smol::Executor<'a>`, not only `Executor<'static>`.
+
+### Fixed
+
+- Restarting right after `cancel` in a full embassy task pool panicked, because the
+  cancelled task keeps its slot until the executor runs it again. Use `cancel_and_wait`
+  before restarting, or handle the `SpawnError` that `begin` now returns.
+- The docs now say that callbacks don't run when the task is cancelled or dropped by the
+  runtime, that cancelling is cooperative, and that caught panics are still reported by
+  the panic hook.
+
 ## 0.3.0
 
 ### Breaking changes

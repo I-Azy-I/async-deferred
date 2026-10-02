@@ -1,11 +1,12 @@
 //! `LocalSpawner` and the `*_local_on` methods, using a single-threaded `LocalPool`.
+#![cfg(feature = "alloc")]
 
 mod common;
 
 use std::cell::Cell;
 use std::rc::Rc;
 
-use async_deferred::{Deferred, Error, State};
+use async_deferred::{BeginError, Deferred, Error, State};
 use common::{pending_until_dropped, DroppingSpawner, PoolSpawner};
 use futures_channel::oneshot;
 use futures_executor::LocalPool;
@@ -15,17 +16,25 @@ fn start_local_on_runs_non_send_future() {
     let mut pool = LocalPool::new();
     let shared = Rc::new(41);
     let mut deferred =
-        Deferred::start_local_on(&PoolSpawner(pool.spawner()), async move { *shared + 1 });
+        Deferred::start_local_on(&PoolSpawner(pool.spawner()), async move { *shared + 1 }).unwrap();
     assert_eq!(deferred.state(), State::Pending);
     pool.run_until_stalled();
     assert_eq!(deferred.try_get(), Some(&42));
 }
 
 #[test]
+fn local_spawner_behind_a_pointer() {
+    let mut pool = LocalPool::new();
+    let spawner = Rc::new(PoolSpawner(pool.spawner()));
+    let mut deferred = Deferred::start_local_on(&spawner, async { 42 }).unwrap();
+    assert_eq!(pool.run_until(deferred.join()), Ok(&42));
+}
+
+#[test]
 fn non_send_result() {
     let mut pool = LocalPool::new();
     let mut deferred =
-        Deferred::start_local_on(&PoolSpawner(pool.spawner()), async { Rc::new(42) });
+        Deferred::start_local_on(&PoolSpawner(pool.spawner()), async { Rc::new(42) }).unwrap();
     let result = pool.run_until(deferred.join()).map(|v| **v);
     assert_eq!(result, Ok(42));
 }
@@ -35,8 +44,11 @@ fn begin_local_on() {
     let mut pool = LocalPool::new();
     let spawner = PoolSpawner(pool.spawner());
     let mut deferred = Deferred::new();
-    assert!(deferred.begin_local_on(&spawner, async { 42 }));
-    assert!(!deferred.begin_local_on(&spawner, async { 0 }));
+    assert_eq!(deferred.begin_local_on(&spawner, async { 42 }), Ok(()));
+    assert_eq!(
+        deferred.begin_local_on(&spawner, async { 0 }),
+        Err(BeginError::AlreadyStarted)
+    );
     assert_eq!(pool.run_until(deferred.join()), Ok(&42));
 }
 
@@ -49,7 +61,8 @@ fn start_with_callback_local_on_with_non_send_callback() {
         &PoolSpawner(pool.spawner()),
         async { 42 },
         move |v| seen_in_callback.set(*v),
-    );
+    )
+    .unwrap();
     pool.run_until(deferred.join()).unwrap();
     assert_eq!(seen.get(), 42);
 }
@@ -61,12 +74,16 @@ fn begin_with_callback_local_on() {
     let seen = Rc::new(Cell::new(0));
     let seen_in_callback = seen.clone();
     let mut deferred = Deferred::new();
-    assert!(
+    assert_eq!(
         deferred.begin_with_callback_local_on(&spawner, async { 42 }, move |v| {
             seen_in_callback.set(*v)
-        })
+        }),
+        Ok(())
     );
-    assert!(!deferred.begin_with_callback_local_on(&spawner, async { 0 }, |_| {}));
+    assert_eq!(
+        deferred.begin_with_callback_local_on(&spawner, async { 0 }, |_| {}),
+        Err(BeginError::AlreadyStarted)
+    );
     pool.run_until(deferred.join()).unwrap();
     assert_eq!(seen.get(), 42);
 }
@@ -75,7 +92,7 @@ fn begin_with_callback_local_on() {
 fn cancel_stops_local_task() {
     let mut pool = LocalPool::new();
     let (future, mut dropped) = pending_until_dropped::<u32>();
-    let mut deferred = Deferred::start_local_on(&PoolSpawner(pool.spawner()), future);
+    let mut deferred = Deferred::start_local_on(&PoolSpawner(pool.spawner()), future).unwrap();
     pool.run_until_stalled();
     assert!(deferred.cancel());
     pool.run_until_stalled();
@@ -86,15 +103,16 @@ fn cancel_stops_local_task() {
 #[test]
 fn dropped_pool_reports_cancelled() {
     let pool = LocalPool::new();
-    let mut deferred =
-        Deferred::start_local_on(&PoolSpawner(pool.spawner()), std::future::pending::<u32>());
+    let deferred =
+        Deferred::start_local_on(&PoolSpawner(pool.spawner()), std::future::pending::<u32>())
+            .unwrap();
     drop(pool);
     assert_eq!(deferred.state(), State::Cancelled);
 }
 
 #[test]
 fn task_dropped_by_local_spawner_reports_cancelled() {
-    let mut deferred = Deferred::start_local_on(&DroppingSpawner, async { 42 });
+    let mut deferred = Deferred::start_local_on(&DroppingSpawner, async { 42 }).unwrap();
     assert_eq!(deferred.state(), State::Cancelled);
     assert_eq!(
         futures_executor::block_on(deferred.join()),
@@ -107,7 +125,7 @@ fn task_dropped_by_local_spawner_reports_cancelled() {
 fn local_task_panic() {
     let mut pool = LocalPool::new();
     let mut deferred: Deferred<u32> =
-        Deferred::start_local_on(&PoolSpawner(pool.spawner()), async { panic!("boom") });
+        Deferred::start_local_on(&PoolSpawner(pool.spawner()), async { panic!("boom") }).unwrap();
     assert_eq!(
         pool.run_until(deferred.join()),
         Err(Error::Panicked("boom".into()))
@@ -121,7 +139,8 @@ fn local_callback_panic_keeps_value() {
     let mut deferred =
         Deferred::start_with_callback_local_on(&PoolSpawner(pool.spawner()), async { 42 }, |_| {
             panic!("boom")
-        });
+        })
+        .unwrap();
     pool.run_until_stalled();
     assert_eq!(deferred.state(), State::CallbackPanicked);
     assert_eq!(deferred.try_get(), Some(&42));

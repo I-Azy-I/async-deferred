@@ -8,7 +8,7 @@ use common::{pending_until_dropped, Flag};
 
 #[test]
 fn start_on_global_executor() {
-    let mut deferred = Deferred::start_on(&Smol, async { 42 });
+    let mut deferred = Deferred::start_on(&Smol, async { 42 }).unwrap();
     assert_eq!(smol::block_on(deferred.join()), Ok(&42));
 }
 
@@ -17,14 +17,15 @@ fn callback_on_global_executor() {
     let ran = Flag::default();
     let ran_in_callback = ran.clone();
     let mut deferred =
-        Deferred::start_with_callback_on(&Smol, async { 42 }, move |_| ran_in_callback.set());
+        Deferred::start_with_callback_on(&Smol, async { 42 }, move |_| ran_in_callback.set())
+            .unwrap();
     smol::block_on(deferred.join()).unwrap();
     assert!(ran.is_set());
 }
 
 #[test]
 fn task_panic_on_global_executor() {
-    let mut deferred: Deferred<u32> = Deferred::start_on(&Smol, async { panic!("boom") });
+    let mut deferred: Deferred<u32> = Deferred::start_on(&Smol, async { panic!("boom") }).unwrap();
     assert_eq!(
         smol::block_on(deferred.join()),
         Err(Error::Panicked("boom".into()))
@@ -34,7 +35,7 @@ fn task_panic_on_global_executor() {
 #[test]
 fn cancel_on_global_executor() {
     let (future, dropped) = pending_until_dropped::<u32>();
-    let mut deferred = Deferred::start_on(&Smol, future);
+    let mut deferred = Deferred::start_on(&Smol, future).unwrap();
     assert!(deferred.cancel());
     assert!(smol::block_on(dropped).is_err());
 }
@@ -42,7 +43,7 @@ fn cancel_on_global_executor() {
 #[test]
 fn start_on_executor() {
     let executor = smol::Executor::new();
-    let mut deferred = Deferred::start_on(&executor, async { 42 });
+    let mut deferred = Deferred::start_on(&executor, async { 42 }).unwrap();
     assert_eq!(deferred.state(), State::Pending);
     assert_eq!(smol::block_on(executor.run(deferred.join())), Ok(&42));
 }
@@ -50,7 +51,36 @@ fn start_on_executor() {
 #[test]
 fn executor_drop_reports_cancelled() {
     let executor = smol::Executor::new();
-    let mut deferred = Deferred::start_on(&executor, std::future::pending::<u32>());
+    let deferred = Deferred::start_on(&executor, std::future::pending::<u32>()).unwrap();
     drop(executor);
     assert_eq!(deferred.state(), State::Cancelled);
+}
+
+#[test]
+fn start_on_executor_with_borrowed_tasks() {
+    // An executor whose own tasks borrow local data, so it is not `Executor<'static>`.
+    let data = [1, 2, 3];
+    let executor = smol::Executor::new();
+    let sum = executor.spawn(async { data.iter().sum::<i32>() });
+    let mut deferred = Deferred::start_on(&executor, async { 42 }).unwrap();
+    smol::block_on(executor.run(async {
+        assert_eq!(sum.await, 6);
+        assert_eq!(deferred.join().await, Ok(&42));
+    }));
+}
+
+#[test]
+fn local_executor_runs_non_send_future() {
+    let executor = smol::LocalExecutor::new();
+    let shared = std::rc::Rc::new(41);
+    let deferred = Deferred::start_local_on(&executor, async move { *shared + 1 }).unwrap();
+    assert_eq!(smol::block_on(executor.run(deferred.into_result())), Ok(42));
+}
+
+#[test]
+fn dropped_local_executor_reports_cancelled() {
+    let executor = smol::LocalExecutor::new();
+    let deferred = Deferred::start_local_on(&executor, std::future::pending::<u32>()).unwrap();
+    drop(executor);
+    assert!(deferred.is_cancelled());
 }

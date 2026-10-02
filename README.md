@@ -4,7 +4,7 @@
 [![crates.io](https://img.shields.io/crates/v/async-deferred.svg)](https://crates.io/crates/async-deferred)
 [![docs.rs](https://docs.rs/async-deferred/badge.svg)](https://docs.rs/async-deferred)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
-[![no_std](https://img.shields.io/badge/no__std-alloc-green.svg)](https://docs.rust-embedded.org/book/intro/no-std.html)
+[![no_std](https://img.shields.io/badge/no__std-yes-green.svg)](https://docs.rust-embedded.org/book/intro/no-std.html)
 
 A lightweight utility for fire-and-forget async computations in Rust. Start asynchronous tasks immediately and retrieve their results later without blocking. Works with any async runtime.
 
@@ -16,7 +16,8 @@ A lightweight utility for fire-and-forget async computations in Rust. Start asyn
 - **Callback support**: run code with the result as soon as the task finishes
 - **Cancellation**: stop a running task and reuse the `Deferred`
 - **Any runtime**: Tokio by default, smol behind a feature, or your own through the `Spawner` trait
-- **`no_std`**: works on embedded executors such as embassy, with a heap allocator
+- **`no_std`**: works on embedded executors such as embassy, with a heap allocator or,
+  with `StaticDeferred`, without one
 
 The result type only needs to be `Send + 'static`, the same as `tokio::spawn`.
 
@@ -81,6 +82,11 @@ async fn main() {
     // Get the result when ready
     let result = deferred.join().await;
     assert_eq!(result, Ok(&42));
+
+    // Or take ownership of the result: `.await` consumes the Deferred
+    let deferred = Deferred::start(async { String::from("owned") });
+    let value: String = deferred.await.unwrap();
+    assert_eq!(value, "owned");
 }
 ```
 
@@ -116,7 +122,7 @@ async fn main() {
     assert_eq!(deferred.state(), State::NotStarted);
 
     // The Deferred can be reused
-    deferred.begin(async { 100 });
+    deferred.begin(async { 100 }).unwrap();
     assert_eq!(deferred.join().await, Ok(&100));
 }
 ```
@@ -127,14 +133,16 @@ Tasks are started through a spawner, which hands them to an async runtime.
 
 | Feature | Spawner | Notes |
 |---|---|---|
-| `tokio` (default) | `Tokio`, `tokio::runtime::Handle` | Enables the `start` and `begin` shortcuts used above |
-| `smol` | `Smol`, `smol::Executor<'static>` | |
-| `std` (default) | | Catches panics in the task and callback. Without it, the crate is `no_std` + `alloc` |
+| `tokio` (default) | `Tokio`, `tokio::runtime::Handle`, `tokio::task::LocalSet` (local) | Enables the `start` and `begin` shortcuts used above |
+| `smol` | `Smol`, `smol::Executor`, `smol::LocalExecutor` (local) | |
+| `std` (default) | | Catches panics in the task and callback. Without it, the crate is `no_std` |
+| `alloc` (with `std`) | | `Deferred`, which keeps its task on the heap. Needs atomic compare-and-swap |
+| `static-deferred` | | `StaticDeferred`, which needs no heap |
 
 To use another runtime without pulling in Tokio:
 
 ```toml
-async-deferred = { version = "0.3", default-features = false, features = ["smol"] }
+async-deferred = { version = "0.4", default-features = false, features = ["smol"] }
 ```
 
 ### smol
@@ -143,7 +151,7 @@ async-deferred = { version = "0.3", default-features = false, features = ["smol"
 use async_deferred::{Deferred, Smol};
 
 fn main() {
-    let mut deferred = Deferred::start_on(&Smol, async { 42 });
+    let mut deferred = Deferred::start_on(&Smol, async { 42 }).unwrap();
     assert_eq!(smol::block_on(deferred.join()), Ok(&42));
 }
 ```
@@ -154,21 +162,22 @@ Any runtime works by implementing `Spawner`:
 
 ```rust
 use std::future::Future;
-use async_deferred::{Deferred, Spawner};
+use async_deferred::{Deferred, SpawnError, Spawner};
 
 struct MyRuntime;
 
 impl Spawner for MyRuntime {
-    fn spawn<F>(&self, task: F)
+    fn spawn<F>(&self, task: F) -> Result<(), SpawnError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        // Hand `task` to your runtime here.
+        // Hand `task` to your runtime here, or return a `SpawnError` if it can't take it.
         std::thread::spawn(move || futures_executor::block_on(task));
+        Ok(())
     }
 }
 
-let mut deferred = Deferred::start_on(&MyRuntime, async { 42 });
+let mut deferred = Deferred::start_on(&MyRuntime, async { 42 }).unwrap();
 ```
 
 For single-threaded executors and futures that are not `Send`, implement `LocalSpawner`
@@ -177,11 +186,12 @@ and use the `*_local_on` methods.
 ### Embassy (`no_std`)
 
 ```toml
-async-deferred = { version = "0.3", default-features = false }
+async-deferred = { version = "0.4", default-features = false, features = ["alloc"] }
 ```
 
 `embassy_spawner!` declares a spawner for embassy in one line. You also need a heap allocator,
-such as `esp-alloc` or `embedded-alloc`, and a target with atomic compare-and-swap.
+such as `esp-alloc` or `embedded-alloc`, and a target with atomic compare-and-swap. On chips
+without it, such as Cortex-M0 (RP2040) or the ESP32-C3, use `StaticDeferred` below.
 
 ```rust,ignore
 use async_deferred::{embassy_spawner, Deferred};
@@ -195,7 +205,7 @@ async fn main(spawner: embassy_executor::Spawner) {
     // ... set up the heap allocator and the time driver ...
     let spawner = DeferredSpawner(spawner);
 
-    let mut measurement = Deferred::start_local_on(&spawner, read_sensor());
+    let mut measurement = Deferred::start_local_on(&spawner, read_sensor()).unwrap();
     let mut started = Instant::now();
 
     loop {
@@ -206,25 +216,78 @@ async fn main(spawner: embassy_executor::Spawner) {
         if let Some(value) = measurement.take() {
             defmt::info!("temperature: {}", value);
         } else if started.elapsed() > Duration::from_millis(500) {
-            measurement.cancel(); // the sensor hung: give up
+            // The sensor hung: give up, and wait until its task has freed its slot.
+            measurement.cancel_and_wait().await;
         } else {
             continue;
         }
 
         // `take` and `cancel` reset the `Deferred`, so it can start the next measurement.
-        measurement.begin_local_on(&spawner, read_sensor());
+        if measurement.begin_local_on(&spawner, read_sensor()).is_err() {
+            defmt::error!("could not start a measurement");
+        }
         started = Instant::now();
     }
 }
 ```
 
 The futures can hold values that are not `Send`, such as `Rc` or peripheral drivers.
-Starting more than `pool_size` tasks at the same time panics.
+Starting a task while `pool_size` tasks are running returns a `SpawnError` instead of
+panicking. A cancelled task frees its slot the next time the executor runs it: use
+`cancel_and_wait` to restart right away in a full pool.
 Without the `std` feature, panics are not caught, so `TaskPanicked` and `CallbackPanicked`
 are never reported. On embedded targets a panic usually halts the device anyway.
 
 A complete example for the ESP32-S3, with tests that run on the chip, is in
 [`embassy-esp32s3/`](https://github.com/I-Azy-I/async-deferred/tree/main/embassy-esp32s3).
+
+### Without a heap (`StaticDeferred`)
+
+```toml
+async-deferred = { version = "0.4", default-features = false, features = ["static-deferred"] }
+```
+
+`StaticDeferred` keeps the result in a `static` instead of on the heap, so it works on targets
+without an allocator and keeps memory use fixed. Each kind of job gets its own `static` and
+its own task: `begin` returns a `Ticket`, which the task uses to run the job.
+
+```rust,ignore
+use async_deferred::{StaticDeferred, Ticket};
+
+static MEASUREMENT: StaticDeferred<u32> = StaticDeferred::new();
+
+#[embassy_executor::task]
+async fn measurement_task(ticket: Ticket<'static, u32>) {
+    ticket.run(read_sensor()).await;
+}
+
+#[embassy_executor::main]
+async fn main(spawner: embassy_executor::Spawner) {
+    // If the task can't be spawned, the ticket is dropped and `MEASUREMENT` resets.
+    if let Ok(ticket) = MEASUREMENT.begin() {
+        if let Ok(token) = measurement_task(ticket) {
+            spawner.spawn(token);
+        }
+    }
+
+    // ... do other work ...
+
+    // Check for the result without waiting.
+    if let Some(value) = MEASUREMENT.take() {
+        defmt::info!("temperature: {}", value);
+    }
+}
+```
+
+All methods take `&self`, so the `static` can be used from any task. It has `state`, `take`,
+`join`, `cancel` and `cancel_and_wait` like `Deferred`, but no callbacks, and panics in the
+job are not caught. It needs a
+[`critical-section`](https://docs.rs/critical-section) implementation, which embassy and the
+HALs provide. On `std`, add `critical-section = { version = "1", features = ["std"] }` to your
+dependencies; without one, linking fails with `undefined symbol: _critical_section_1_0_acquire`.
+
+A complete example for the ESP32-S3, with tests that run on the chip, is in
+[`embassy-esp32s3-no-heap/`](https://github.com/I-Azy-I/async-deferred/tree/main/embassy-esp32s3-no-heap).
 
 ## License
 
