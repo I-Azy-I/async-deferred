@@ -1,5 +1,11 @@
 # async-deferred
 
+[![CI](https://github.com/I-Azy-I/async-deferred/actions/workflows/ci.yml/badge.svg)](https://github.com/I-Azy-I/async-deferred/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/async-deferred.svg)](https://crates.io/crates/async-deferred)
+[![docs.rs](https://docs.rs/async-deferred/badge.svg)](https://docs.rs/async-deferred)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
+[![no_std](https://img.shields.io/badge/no__std-alloc-green.svg)](https://docs.rust-embedded.org/book/intro/no-std.html)
+
 A lightweight utility for fire-and-forget async computations in Rust. Start asynchronous tasks immediately and retrieve their results later without blocking. Works with any async runtime.
 
 ## Features
@@ -219,3 +225,7 @@ are never reported. On embedded targets a panic usually halts the device anyway.
 
 A complete example for the ESP32-S3, with tests that run on the chip, is in
 [`embassy-esp32s3/`](https://github.com/I-Azy-I/async-deferred/tree/main/embassy-esp32s3).
+
+## License
+
+Licensed under the MIT license.
