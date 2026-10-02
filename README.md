@@ -1,32 +1,44 @@
 # async-deferred
 
-A lightweight utility for fire-and-forget async computations in Rust. Start asynchronous tasks immediately and retrieve their results later without blocking.
+[![CI](https://github.com/I-Azy-I/async-deferred/actions/workflows/ci.yml/badge.svg)](https://github.com/I-Azy-I/async-deferred/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/async-deferred.svg)](https://crates.io/crates/async-deferred)
+[![docs.rs](https://docs.rs/async-deferred/badge.svg)](https://docs.rs/async-deferred)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
+[![no_std](https://img.shields.io/badge/no__std-alloc-green.svg)](https://docs.rust-embedded.org/book/intro/no-std.html)
+
+A lightweight utility for fire-and-forget async computations in Rust. Start asynchronous tasks immediately and retrieve their results later without blocking. Works with any async runtime.
 
 ## Features
 
-- **Fire-and-forget pattern**: Start computations without waiting for results
-- **Deferred retrieval**: Check results when convenient using non-blocking operations
-- **Panic handling**: Detect and handle task panics gracefully
-- **Callback support**: Execute cleanup or notification code after task completion
+- **Fire-and-forget pattern**: start computations without waiting for results
+- **Deferred retrieval**: check results when convenient using non-blocking operations
+- **Panic handling**: detect if the task or its callback panicked, and why
+- **Callback support**: run code with the result as soon as the task finishes
+- **Cancellation**: stop a running task and reuse the `Deferred`
+- **Any runtime**: Tokio by default, smol behind a feature, or your own through the `Spawner` trait
+- **`no_std`**: works on embedded executors such as embassy, with a heap allocator
 
+The result type only needs to be `Send + 'static`, the same as `tokio::spawn`.
 
 ## Examples
 
 ### Non-blocking Result Checking
 
 ```rust
-use async_deferred::{Deferred, State};
+use async_deferred::Deferred;
+use std::time::Duration;
+use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() {
-    let deferred = Deferred::start(|| async {
-        sleep(Duration::from_secs(1)).await;
+    let mut deferred = Deferred::start(async {
+        sleep(Duration::from_millis(100)).await;
         "Hello, World!"
     });
 
     // Check if ready without blocking
     match deferred.try_get() {
-        Some(result) => println!("Result ready: {}", result),
+        Some(result) => println!("Result ready: {result}"),
         None => println!("Still computing..."),
     }
 }
@@ -40,16 +52,11 @@ use async_deferred::Deferred;
 #[tokio::main]
 async fn main() {
     let mut deferred = Deferred::start_with_callback(
-        || async {
-            // Your computation
-            expensive_calculation().await
-        },
-        || {
-            println!("Computation finished! Cleaning up...");
-        }
+        async { 6 * 7 },
+        |result| println!("Computation finished with {result}"),
     );
 
-    let result = deferred.join().await.try_get();
+    deferred.join().await.unwrap();
 }
 ```
 
@@ -63,46 +70,162 @@ use tokio::time::sleep;
 #[tokio::main]
 async fn main() {
     // Start a computation immediately
-    let mut deferred = Deferred::start(|| async {
-        println!("Starting async work...");
-        sleep(Duration::from_secs(2)).await;
-        42 // Return result
+    let mut deferred = Deferred::start(async {
+        sleep(Duration::from_millis(100)).await;
+        42
     });
 
     // Do other work while computation runs
     println!("Doing other work...");
-    sleep(Duration::from_millis(500)).await;
 
     // Get the result when ready
-    let result = deferred.join().await.try_get();
-    println!("Result: {:?}", result); // Result: Some(42)
+    let result = deferred.join().await;
+    assert_eq!(result, Ok(&42));
 }
 ```
 
 ### Error Handling
 
 ```rust
+use async_deferred::{Deferred, Error};
+
+#[tokio::main]
+async fn main() {
+    let mut deferred: Deferred<u32> = Deferred::start(async {
+        panic!("Something went wrong!");
+    });
+
+    match deferred.join().await {
+        Ok(result) => println!("Result: {result}"),
+        Err(Error::Panicked(msg)) => println!("Task panicked: {msg}"),
+        Err(err) => println!("No result: {err}"),
+    }
+}
+```
+
+### Cancellation
+
+```rust
 use async_deferred::{Deferred, State};
 
 #[tokio::main]
 async fn main() {
-    let mut deferred = Deferred::start(|| async {
-        panic!("Something went wrong!");
-    });
+    let mut deferred = Deferred::start(std::future::pending::<u32>());
 
-    // Wait for completion
-    deferred.join().await;
+    assert!(deferred.cancel());
+    assert_eq!(deferred.state(), State::NotStarted);
 
-    match deferred.state() {
-        State::TaskPanicked(msg) => {
-            println!("Task panicked: {}", msg);
+    // The Deferred can be reused
+    deferred.begin(async { 100 });
+    assert_eq!(deferred.join().await, Ok(&100));
+}
+```
+
+## Runtimes
+
+Tasks are started through a spawner, which hands them to an async runtime.
+
+| Feature | Spawner | Notes |
+|---|---|---|
+| `tokio` (default) | `Tokio`, `tokio::runtime::Handle` | Enables the `start` and `begin` shortcuts used above |
+| `smol` | `Smol`, `smol::Executor<'static>` | |
+| `std` (default) | | Catches panics in the task and callback. Without it, the crate is `no_std` + `alloc` |
+
+To use another runtime without pulling in Tokio:
+
+```toml
+async-deferred = { version = "0.3", default-features = false, features = ["smol"] }
+```
+
+### smol
+
+```rust,ignore
+use async_deferred::{Deferred, Smol};
+
+fn main() {
+    let mut deferred = Deferred::start_on(&Smol, async { 42 });
+    assert_eq!(smol::block_on(deferred.join()), Ok(&42));
+}
+```
+
+### Your own runtime
+
+Any runtime works by implementing `Spawner`:
+
+```rust
+use std::future::Future;
+use async_deferred::{Deferred, Spawner};
+
+struct MyRuntime;
+
+impl Spawner for MyRuntime {
+    fn spawn<F>(&self, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        // Hand `task` to your runtime here.
+        std::thread::spawn(move || futures_executor::block_on(task));
+    }
+}
+
+let mut deferred = Deferred::start_on(&MyRuntime, async { 42 });
+```
+
+For single-threaded executors and futures that are not `Send`, implement `LocalSpawner`
+and use the `*_local_on` methods.
+
+### Embassy (`no_std`)
+
+```toml
+async-deferred = { version = "0.3", default-features = false }
+```
+
+`embassy_spawner!` declares a spawner for embassy in one line. You also need a heap allocator,
+such as `esp-alloc` or `embedded-alloc`, and a target with atomic compare-and-swap.
+
+```rust,ignore
+use async_deferred::{embassy_spawner, Deferred};
+use embassy_time::{Duration, Instant, Timer};
+
+// Lets up to 4 `Deferred` tasks run at the same time.
+embassy_spawner!(DeferredSpawner, pool_size = 4);
+
+#[embassy_executor::main]
+async fn main(spawner: embassy_executor::Spawner) {
+    // ... set up the heap allocator and the time driver ...
+    let spawner = DeferredSpawner(spawner);
+
+    let mut measurement = Deferred::start_local_on(&spawner, read_sensor());
+    let mut started = Instant::now();
+
+    loop {
+        // The main loop's own work.
+        Timer::after(Duration::from_millis(100)).await;
+
+        // Check for the result without waiting.
+        if let Some(value) = measurement.take() {
+            defmt::info!("temperature: {}", value);
+        } else if started.elapsed() > Duration::from_millis(500) {
+            measurement.cancel(); // the sensor hung: give up
+        } else {
+            continue;
         }
-        State::Completed => {
-            if let Some(result) = deferred.try_get() {
-                println!("Result: {:?}", result);
-            }
-        }
-        _ => {}
+
+        // `take` and `cancel` reset the `Deferred`, so it can start the next measurement.
+        measurement.begin_local_on(&spawner, read_sensor());
+        started = Instant::now();
     }
 }
 ```
+
+The futures can hold values that are not `Send`, such as `Rc` or peripheral drivers.
+Starting more than `pool_size` tasks at the same time panics.
+Without the `std` feature, panics are not caught, so `TaskPanicked` and `CallbackPanicked`
+are never reported. On embedded targets a panic usually halts the device anyway.
+
+A complete example for the ESP32-S3, with tests that run on the chip, is in
+[`embassy-esp32s3/`](https://github.com/I-Azy-I/async-deferred/tree/main/embassy-esp32s3).
+
+## License
+
+Licensed under the [MIT license](https://github.com/I-Azy-I/async-deferred/blob/main/LICENSE).

@@ -1,0 +1,133 @@
+#![allow(dead_code)]
+
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use async_deferred::{Deferred, LocalSpawner, Spawner};
+use futures_channel::oneshot;
+
+/// Runs each task on its own thread.
+pub struct ThreadSpawner;
+
+impl Spawner for ThreadSpawner {
+    fn spawn<F>(&self, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        std::thread::spawn(move || futures_executor::block_on(task));
+    }
+}
+
+/// Drops every task without running it, like a runtime shutting down.
+pub struct DroppingSpawner;
+
+impl Spawner for DroppingSpawner {
+    fn spawn<F>(&self, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        drop(task);
+    }
+}
+
+impl LocalSpawner for DroppingSpawner {
+    fn spawn_local<F>(&self, task: F)
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        drop(task);
+    }
+}
+
+/// Spawns onto a single-threaded `LocalPool`.
+pub struct PoolSpawner(pub futures_executor::LocalSpawner);
+
+impl LocalSpawner for PoolSpawner {
+    fn spawn_local<F>(&self, task: F)
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        use futures_util::task::LocalSpawnExt;
+        self.0.spawn_local(task).unwrap();
+    }
+}
+
+/// Busy-waits until the task is no longer pending.
+pub fn wait_until_finished<T>(deferred: &mut Deferred<T>) {
+    while deferred.is_pending() {
+        std::thread::yield_now();
+    }
+}
+
+/// A future that never finishes and reports when it is dropped.
+pub fn pending_until_dropped<T>() -> (impl Future<Output = T> + Send, oneshot::Receiver<()>) {
+    let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
+    let future = async move {
+        let _guard = dropped_tx; // closes `dropped_rx` when the future is dropped
+        std::future::pending::<T>().await
+    };
+    (future, dropped_rx)
+}
+
+/// A flag a callback can set, to check whether it ran.
+#[derive(Clone, Default)]
+pub struct Flag(Arc<AtomicBool>);
+
+impl Flag {
+    pub fn set(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_set(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Wraps values so tests can check each one is dropped exactly once.
+#[derive(Clone, Default)]
+pub struct DropTracker(Arc<std::sync::Mutex<Vec<Arc<AtomicUsize>>>>);
+
+impl DropTracker {
+    /// Wraps `value`; its drops are counted from now on.
+    pub fn track<T>(&self, value: T) -> Tracked<T> {
+        let drops = Arc::new(AtomicUsize::new(0));
+        self.0.lock().unwrap().push(drops.clone());
+        Tracked { value, drops }
+    }
+
+    /// How many values were wrapped.
+    pub fn created(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+
+    /// How many wrapped values have been dropped so far.
+    pub fn dropped(&self) -> usize {
+        let counts = self.0.lock().unwrap();
+        counts
+            .iter()
+            .filter(|d| d.load(Ordering::SeqCst) > 0)
+            .count()
+    }
+
+    /// Panics unless every wrapped value was dropped exactly once.
+    pub fn assert_all_dropped_once(&self) {
+        for (i, drops) in self.0.lock().unwrap().iter().enumerate() {
+            let drops = drops.load(Ordering::SeqCst);
+            assert_eq!(drops, 1, "tracked value #{i} was dropped {drops} times");
+        }
+    }
+}
+
+/// A value whose drops are counted by a [`DropTracker`].
+#[derive(Debug)]
+pub struct Tracked<T> {
+    pub value: T,
+    drops: Arc<AtomicUsize>,
+}
+
+impl<T> Drop for Tracked<T> {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}

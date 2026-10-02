@@ -1,18 +1,35 @@
 [package]
 name = "async-deferred"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Azy"]
 description = "A lightweight utility for spawning async tasks with fire-and-forget semantics and deferred result retrieval."
 license = "MIT"
 repository = "https://github.com/I-Azy-I/async-deferred"
 readme = "README.md"
-categories = ["asynchronous", "concurrency", "data-structures"]
+categories = ["asynchronous", "concurrency", "data-structures", "no-std", "embedded"]
 keywords = ["async", "deferred", "task", "utility", "tokio"]
 documentation = "https://docs.rs/async-deferred"
 homepage = "https://github.com/I-Azy-I/async-deferred"
+exclude = ["embassy-esp32s3"]
+
+[features]
+default = ["std", "tokio"]
+std = ["futures-util/std"]
+tokio = ["std", "dep:tokio"]
+smol = ["std", "dep:smol"]
 
 [dependencies]
-tokio = { version = "1.*", features = ["rt-multi-thread", "rt", "macros", "sync"]}
+futures-channel = { version = "0.3", default-features = false, features = ["alloc"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+tokio = { version = "1", features = ["rt"], optional = true }
+smol = { version = "2", optional = true }
+
 [dev-dependencies]
+futures-executor = "0.3"
+proptest = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tokio-test = "0.4"
+
+[package.metadata.docs.rs]
+all-features = true
