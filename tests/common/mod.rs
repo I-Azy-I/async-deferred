@@ -4,18 +4,19 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use async_deferred::{Deferred, LocalSpawner, Spawner};
+use async_deferred::{Deferred, LocalSpawner, SpawnError, Spawner};
 use futures_channel::oneshot;
 
 /// Runs each task on its own thread.
 pub struct ThreadSpawner;
 
 impl Spawner for ThreadSpawner {
-    fn spawn<F>(&self, task: F)
+    fn spawn<F>(&self, task: F) -> Result<(), SpawnError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
         std::thread::spawn(move || futures_executor::block_on(task));
+        Ok(())
     }
 }
 
@@ -23,20 +24,22 @@ impl Spawner for ThreadSpawner {
 pub struct DroppingSpawner;
 
 impl Spawner for DroppingSpawner {
-    fn spawn<F>(&self, task: F)
+    fn spawn<F>(&self, task: F) -> Result<(), SpawnError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
         drop(task);
+        Ok(())
     }
 }
 
 impl LocalSpawner for DroppingSpawner {
-    fn spawn_local<F>(&self, task: F)
+    fn spawn_local<F>(&self, task: F) -> Result<(), SpawnError>
     where
         F: Future<Output = ()> + 'static,
     {
         drop(task);
+        Ok(())
     }
 }
 
@@ -44,12 +47,13 @@ impl LocalSpawner for DroppingSpawner {
 pub struct PoolSpawner(pub futures_executor::LocalSpawner);
 
 impl LocalSpawner for PoolSpawner {
-    fn spawn_local<F>(&self, task: F)
+    fn spawn_local<F>(&self, task: F) -> Result<(), SpawnError>
     where
         F: Future<Output = ()> + 'static,
     {
         use futures_util::task::LocalSpawnExt;
         self.0.spawn_local(task).unwrap();
+        Ok(())
     }
 }
 
@@ -129,5 +133,71 @@ pub struct Tracked<T> {
 impl<T> Drop for Tracked<T> {
     fn drop(&mut self) {
         self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A single-threaded executor with a fixed number of task slots, like an embassy pool.
+///
+/// A slot is freed only when the executor polls the task to completion, so a task
+/// cancelled with `cancel()` keeps its slot until the executor runs again.
+#[derive(Clone)]
+pub struct SlotPool {
+    slots: std::rc::Rc<std::cell::RefCell<Vec<Option<LocalTask>>>>,
+}
+
+type LocalTask = std::pin::Pin<Box<dyn Future<Output = ()>>>;
+
+impl SlotPool {
+    pub fn new(slots: usize) -> Self {
+        Self {
+            slots: std::rc::Rc::new(std::cell::RefCell::new((0..slots).map(|_| None).collect())),
+        }
+    }
+
+    /// How many slots hold a task.
+    pub fn used(&self) -> usize {
+        self.slots.borrow().iter().filter(|t| t.is_some()).count()
+    }
+
+    /// Polls every task once, freeing the slots of finished tasks.
+    pub fn run_once(&self) {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let count = self.slots.borrow().len();
+        for i in 0..count {
+            let task = self.slots.borrow_mut()[i].take();
+            if let Some(mut task) = task {
+                if task.as_mut().poll(&mut cx).is_pending() {
+                    self.slots.borrow_mut()[i] = Some(task);
+                }
+            }
+        }
+    }
+
+    /// Runs `future` and the pool's tasks until `future` finishes.
+    pub fn run_until<F: Future>(&self, future: F) -> F::Output {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut future = std::pin::pin!(future);
+        for _ in 0..10_000 {
+            if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+                return output;
+            }
+            self.run_once();
+        }
+        panic!("the future did not finish");
+    }
+}
+
+impl LocalSpawner for SlotPool {
+    fn spawn_local<F>(&self, task: F) -> Result<(), SpawnError>
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        let mut slots = self.slots.borrow_mut();
+        let free = slots
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(SpawnError::new("all slots are used"))?;
+        *free = Some(Box::pin(task));
+        Ok(())
     }
 }

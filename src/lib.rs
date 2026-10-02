@@ -74,6 +74,70 @@ impl fmt::Display for Error {
 #[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
+/// Why a runtime could not start a task. Returned by [`Spawner`] and [`LocalSpawner`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnError {
+    reason: &'static str,
+}
+
+impl SpawnError {
+    /// Creates an error with a short `reason`, such as `"task pool is full"`.
+    pub const fn new(reason: &'static str) -> Self {
+        Self { reason }
+    }
+
+    /// The reason given by the runtime.
+    pub const fn reason(&self) -> &'static str {
+        self.reason
+    }
+}
+
+impl fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "could not spawn the task: {}", self.reason)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SpawnError {}
+
+/// Why a `begin` method did not start a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeginError {
+    /// A task was already started and its result has not been taken.
+    AlreadyStarted,
+    /// The runtime could not start the task.
+    Spawn(SpawnError),
+}
+
+impl From<SpawnError> for BeginError {
+    fn from(err: SpawnError) -> Self {
+        BeginError::Spawn(err)
+    }
+}
+
+impl fmt::Display for BeginError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BeginError::AlreadyStarted => f.write_str("a task was already started"),
+            BeginError::Spawn(err) => err.fmt(f),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for BeginError {}
+
+impl BeginError {
+    /// The spawn error from a `begin` on a new `Deferred`, which can't be `AlreadyStarted`.
+    fn into_spawn_error(self) -> SpawnError {
+        match self {
+            BeginError::Spawn(err) => err,
+            BeginError::AlreadyStarted => unreachable!("a new `Deferred` has no task"),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Inner<T> {
     NotStarted,
@@ -126,32 +190,39 @@ impl<T> Deferred<T> {
 
     /// Spawns `future` with `spawner` and returns its `Deferred`.
     ///
-    /// See [`Spawner`] for using your own runtime.
+    /// Returns an error if the runtime could not start the task, for example because its
+    /// task pool is full. See [`Spawner`] for using your own runtime.
     ///
     /// ```rust
     /// use async_deferred::Deferred;
     ///
     /// // Start a task from outside a Tokio runtime
     /// let runtime = tokio::runtime::Runtime::new().unwrap();
-    /// let mut deferred = Deferred::start_on(runtime.handle(), async { 42 });
+    /// let mut deferred = Deferred::start_on(runtime.handle(), async { 42 }).unwrap();
     /// assert_eq!(runtime.block_on(deferred.join()), Ok(&42));
     /// ```
-    pub fn start_on<S, F>(spawner: &S, future: F) -> Self
+    pub fn start_on<S, F>(spawner: &S, future: F) -> Result<Self, SpawnError>
     where
         S: Spawner,
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
         let mut deferred = Self::new();
-        deferred.begin_on(spawner, future);
         deferred
+            .begin_on(spawner, future)
+            .map_err(BeginError::into_spawn_error)?;
+        Ok(deferred)
     }
 
     /// Like [`start_on`](Self::start_on), and runs `callback` with the result once
     /// `future` finishes.
     ///
     /// The callback is not run if `future` panics.
-    pub fn start_with_callback_on<S, F, C>(spawner: &S, future: F, callback: C) -> Self
+    pub fn start_with_callback_on<S, F, C>(
+        spawner: &S,
+        future: F,
+        callback: C,
+    ) -> Result<Self, SpawnError>
     where
         S: Spawner,
         F: Future<Output = T> + Send + 'static,
@@ -159,15 +230,17 @@ impl<T> Deferred<T> {
         T: Send + 'static,
     {
         let mut deferred = Self::new();
-        deferred.begin_with_callback_on(spawner, future, callback);
         deferred
+            .begin_with_callback_on(spawner, future, callback)
+            .map_err(BeginError::into_spawn_error)?;
+        Ok(deferred)
     }
 
     /// Spawns `future` with `spawner`.
     ///
-    /// Returns `false` and does nothing if a task was already started and its result
-    /// has not been taken.
-    pub fn begin_on<S, F>(&mut self, spawner: &S, future: F) -> bool
+    /// Returns an error and does nothing if a task was already started and its result
+    /// has not been taken, or if the runtime could not start the task.
+    pub fn begin_on<S, F>(&mut self, spawner: &S, future: F) -> Result<(), BeginError>
     where
         S: Spawner,
         F: Future<Output = T> + Send + 'static,
@@ -180,7 +253,12 @@ impl<T> Deferred<T> {
     /// `future` finishes.
     ///
     /// The callback is not run if `future` panics.
-    pub fn begin_with_callback_on<S, F, C>(&mut self, spawner: &S, future: F, callback: C) -> bool
+    pub fn begin_with_callback_on<S, F, C>(
+        &mut self,
+        spawner: &S,
+        future: F,
+        callback: C,
+    ) -> Result<(), BeginError>
     where
         S: Spawner,
         F: Future<Output = T> + Send + 'static,
@@ -188,29 +266,35 @@ impl<T> Deferred<T> {
         T: Send + 'static,
     {
         if !self.is_not_started() {
-            return false;
+            return Err(BeginError::AlreadyStarted);
         }
         let (task, running) = task(future, callback);
-        spawner.spawn(task);
+        spawner.spawn(task)?;
         self.inner = running;
-        true
+        Ok(())
     }
 
     /// Like [`start_on`](Self::start_on), for futures that are not `Send`.
-    pub fn start_local_on<S, F>(spawner: &S, future: F) -> Self
+    pub fn start_local_on<S, F>(spawner: &S, future: F) -> Result<Self, SpawnError>
     where
         S: LocalSpawner,
         F: Future<Output = T> + 'static,
         T: 'static,
     {
         let mut deferred = Self::new();
-        deferred.begin_local_on(spawner, future);
         deferred
+            .begin_local_on(spawner, future)
+            .map_err(BeginError::into_spawn_error)?;
+        Ok(deferred)
     }
 
     /// Like [`start_with_callback_on`](Self::start_with_callback_on), for futures that
     /// are not `Send`.
-    pub fn start_with_callback_local_on<S, F, C>(spawner: &S, future: F, callback: C) -> Self
+    pub fn start_with_callback_local_on<S, F, C>(
+        spawner: &S,
+        future: F,
+        callback: C,
+    ) -> Result<Self, SpawnError>
     where
         S: LocalSpawner,
         F: Future<Output = T> + 'static,
@@ -218,12 +302,14 @@ impl<T> Deferred<T> {
         T: 'static,
     {
         let mut deferred = Self::new();
-        deferred.begin_with_callback_local_on(spawner, future, callback);
         deferred
+            .begin_with_callback_local_on(spawner, future, callback)
+            .map_err(BeginError::into_spawn_error)?;
+        Ok(deferred)
     }
 
     /// Like [`begin_on`](Self::begin_on), for futures that are not `Send`.
-    pub fn begin_local_on<S, F>(&mut self, spawner: &S, future: F) -> bool
+    pub fn begin_local_on<S, F>(&mut self, spawner: &S, future: F) -> Result<(), BeginError>
     where
         S: LocalSpawner,
         F: Future<Output = T> + 'static,
@@ -239,7 +325,7 @@ impl<T> Deferred<T> {
         spawner: &S,
         future: F,
         callback: C,
-    ) -> bool
+    ) -> Result<(), BeginError>
     where
         S: LocalSpawner,
         F: Future<Output = T> + 'static,
@@ -247,12 +333,12 @@ impl<T> Deferred<T> {
         T: 'static,
     {
         if !self.is_not_started() {
-            return false;
+            return Err(BeginError::AlreadyStarted);
         }
         let (task, running) = task(future, callback);
-        spawner.spawn_local(task);
+        spawner.spawn_local(task)?;
         self.inner = running;
-        true
+        Ok(())
     }
 
     /// If the task has finished, stores its outcome. Never waits.
@@ -363,7 +449,9 @@ impl<T> Deferred<T> {
 
     /// Stops a running task and resets the `Deferred` so it can start a new one.
     ///
-    /// The task stops the next time the runtime polls it.
+    /// The task stops the next time the runtime polls it, so it may still hold its runtime
+    /// resources, such as an embassy task pool slot, when this returns. Use
+    /// [`cancel_and_wait`](Self::cancel_and_wait) to wait until it has stopped.
     /// Returns `false` and does nothing if no task is running.
     ///
     /// ```rust
@@ -382,6 +470,37 @@ impl<T> Deferred<T> {
         };
         abort.abort();
         self.inner = Inner::NotStarted;
+        true
+    }
+
+    /// Like [`cancel`](Self::cancel), and waits until the task has stopped.
+    ///
+    /// Once this returns, the task no longer holds its runtime resources, so a new task
+    /// can be started even on a runtime with a single free slot.
+    /// Returns `false` and does nothing if no task is running.
+    ///
+    /// ```rust
+    /// use async_deferred::{Deferred, State};
+    ///
+    /// # tokio_test::block_on(async {
+    /// let mut deferred = Deferred::start(std::future::pending::<u32>());
+    /// assert!(deferred.cancel_and_wait().await);
+    /// assert_eq!(deferred.state(), State::NotStarted);
+    /// # })
+    /// ```
+    pub async fn cancel_and_wait(&mut self) -> bool {
+        self.poll_task();
+        if !matches!(self.inner, Inner::Running { .. }) {
+            return false;
+        }
+        let Inner::Running { receiver, abort } =
+            core::mem::replace(&mut self.inner, Inner::NotStarted)
+        else {
+            unreachable!("checked above")
+        };
+        abort.abort();
+        // The task sends its outcome or drops the sender as it stops.
+        let _ = receiver.await;
         true
     }
 
@@ -424,7 +543,7 @@ impl<T> Deferred<T> {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        Self::start_on(&Tokio, future)
+        Self::start_on(&Tokio, future).expect("the Tokio spawner never fails")
     }
 
     /// Like [`start`](Self::start), and runs `callback` with the result once `future` finishes.
@@ -448,12 +567,13 @@ impl<T> Deferred<T> {
         T: Send + 'static,
     {
         Self::start_with_callback_on(&Tokio, future, callback)
+            .expect("the Tokio spawner never fails")
     }
 
     /// Spawns `future` on the current Tokio runtime.
     ///
-    /// Returns `false` and does nothing if a task was already started and its result
-    /// has not been taken.
+    /// Returns [`BeginError::AlreadyStarted`] and does nothing if a task was already
+    /// started and its result has not been taken.
     ///
     /// # Panics
     ///
@@ -464,11 +584,11 @@ impl<T> Deferred<T> {
     ///
     /// # tokio_test::block_on(async {
     /// let mut deferred = Deferred::new();
-    /// assert!(deferred.begin(async { 42 }));
-    /// assert!(!deferred.begin(async { 24 }));
+    /// assert!(deferred.begin(async { 42 }).is_ok());
+    /// assert!(deferred.begin(async { 24 }).is_err());
     /// # })
     /// ```
-    pub fn begin<F>(&mut self, future: F) -> bool
+    pub fn begin<F>(&mut self, future: F) -> Result<(), BeginError>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
@@ -479,7 +599,7 @@ impl<T> Deferred<T> {
     /// Like [`begin`](Self::begin), and runs `callback` with the result once `future` finishes.
     ///
     /// The callback is not run if `future` panics.
-    pub fn begin_with_callback<F, C>(&mut self, future: F, callback: C) -> bool
+    pub fn begin_with_callback<F, C>(&mut self, future: F, callback: C) -> Result<(), BeginError>
     where
         F: Future<Output = T> + Send + 'static,
         C: FnOnce(&T) + Send + 'static,

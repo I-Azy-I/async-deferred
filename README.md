@@ -116,7 +116,7 @@ async fn main() {
     assert_eq!(deferred.state(), State::NotStarted);
 
     // The Deferred can be reused
-    deferred.begin(async { 100 });
+    deferred.begin(async { 100 }).unwrap();
     assert_eq!(deferred.join().await, Ok(&100));
 }
 ```
@@ -143,7 +143,7 @@ async-deferred = { version = "0.3", default-features = false, features = ["smol"
 use async_deferred::{Deferred, Smol};
 
 fn main() {
-    let mut deferred = Deferred::start_on(&Smol, async { 42 });
+    let mut deferred = Deferred::start_on(&Smol, async { 42 }).unwrap();
     assert_eq!(smol::block_on(deferred.join()), Ok(&42));
 }
 ```
@@ -154,21 +154,22 @@ Any runtime works by implementing `Spawner`:
 
 ```rust
 use std::future::Future;
-use async_deferred::{Deferred, Spawner};
+use async_deferred::{Deferred, SpawnError, Spawner};
 
 struct MyRuntime;
 
 impl Spawner for MyRuntime {
-    fn spawn<F>(&self, task: F)
+    fn spawn<F>(&self, task: F) -> Result<(), SpawnError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        // Hand `task` to your runtime here.
+        // Hand `task` to your runtime here, or return a `SpawnError` if it can't take it.
         std::thread::spawn(move || futures_executor::block_on(task));
+        Ok(())
     }
 }
 
-let mut deferred = Deferred::start_on(&MyRuntime, async { 42 });
+let mut deferred = Deferred::start_on(&MyRuntime, async { 42 }).unwrap();
 ```
 
 For single-threaded executors and futures that are not `Send`, implement `LocalSpawner`
@@ -195,7 +196,7 @@ async fn main(spawner: embassy_executor::Spawner) {
     // ... set up the heap allocator and the time driver ...
     let spawner = DeferredSpawner(spawner);
 
-    let mut measurement = Deferred::start_local_on(&spawner, read_sensor());
+    let mut measurement = Deferred::start_local_on(&spawner, read_sensor()).unwrap();
     let mut started = Instant::now();
 
     loop {
@@ -206,20 +207,25 @@ async fn main(spawner: embassy_executor::Spawner) {
         if let Some(value) = measurement.take() {
             defmt::info!("temperature: {}", value);
         } else if started.elapsed() > Duration::from_millis(500) {
-            measurement.cancel(); // the sensor hung: give up
+            // The sensor hung: give up, and wait until its task has freed its slot.
+            measurement.cancel_and_wait().await;
         } else {
             continue;
         }
 
         // `take` and `cancel` reset the `Deferred`, so it can start the next measurement.
-        measurement.begin_local_on(&spawner, read_sensor());
+        if measurement.begin_local_on(&spawner, read_sensor()).is_err() {
+            defmt::error!("could not start a measurement");
+        }
         started = Instant::now();
     }
 }
 ```
 
 The futures can hold values that are not `Send`, such as `Rc` or peripheral drivers.
-Starting more than `pool_size` tasks at the same time panics.
+Starting a task while `pool_size` tasks are running returns a `SpawnError` instead of
+panicking. A cancelled task frees its slot the next time the executor runs it: use
+`cancel_and_wait` to restart right away in a full pool.
 Without the `std` feature, panics are not caught, so `TaskPanicked` and `CallbackPanicked`
 are never reported. On embedded targets a panic usually halts the device anyway.
 

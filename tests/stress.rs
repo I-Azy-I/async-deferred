@@ -101,7 +101,10 @@ fn many_tasks_with_racing_operations() {
                         deferred.join().await.unwrap();
                         assert_eq!(deferred.take().unwrap().value, i);
                         let restarted = i + TASKS;
-                        assert!(deferred.begin(async move { restart_tracker.track(restarted) }));
+                        assert_eq!(
+                            deferred.begin(async move { restart_tracker.track(restarted) }),
+                            Ok(())
+                        );
                         assert_eq!(deferred.join().await.unwrap().value, restarted);
                     }
                 }

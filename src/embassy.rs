@@ -2,8 +2,12 @@
 ///
 /// Embassy only runs tasks declared with `#[embassy_executor::task]`, so this macro declares
 /// one with room for `pool_size` tasks at once, and a spawner type that runs every
-/// [`Deferred`](crate::Deferred) task through it. Starting more tasks than `pool_size` at
-/// the same time panics.
+/// [`Deferred`](crate::Deferred) task through it. Starting a task while `pool_size` tasks
+/// are running returns a [`SpawnError`](crate::SpawnError).
+///
+/// A task cancelled with [`cancel`](crate::Deferred::cancel) frees its slot the next time
+/// the executor runs it. To start a new task right away in a full pool, use
+/// [`cancel_and_wait`](crate::Deferred::cancel_and_wait).
 ///
 /// Needs `embassy-executor` 0.10 and a heap allocator, such as `esp-alloc` or
 /// `embedded-alloc`.
@@ -18,7 +22,7 @@
 /// #[embassy_executor::main]
 /// async fn main(spawner: embassy_executor::Spawner) {
 ///     let spawner = DeferredSpawner(spawner);
-///     let mut reading = Deferred::start_local_on(&spawner, read_sensor());
+///     let mut reading = Deferred::start_local_on(&spawner, read_sensor()).unwrap();
 ///     // ... do other work ...
 ///     let value = reading.join().await;
 /// }
@@ -31,7 +35,7 @@ macro_rules! embassy_spawner {
         $vis struct $name(pub ::embassy_executor::Spawner);
 
         impl $crate::LocalSpawner for $name {
-            fn spawn_local<F>(&self, task: F)
+            fn spawn_local<F>(&self, task: F) -> ::core::result::Result<(), $crate::SpawnError>
             where
                 F: ::core::future::Future<Output = ()> + 'static,
             {
@@ -44,10 +48,14 @@ macro_rules! embassy_spawner {
                     task.await
                 }
 
-                self.0.spawn(run($crate::__private::Box::pin(task)).expect(concat!(
-                    stringify!($name),
-                    ": too many tasks running at once, increase `pool_size`"
-                )));
+                let token = run($crate::__private::Box::pin(task)).map_err(|_| {
+                    $crate::SpawnError::new(concat!(
+                        stringify!($name),
+                        ": all `pool_size` tasks are running"
+                    ))
+                })?;
+                self.0.spawn(token);
+                ::core::result::Result::Ok(())
             }
         }
     };
