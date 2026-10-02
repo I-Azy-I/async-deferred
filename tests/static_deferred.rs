@@ -673,3 +673,28 @@ fn run_dropped_before_its_first_poll() {
     drop(run);
     assert_eq!(deferred.state(), State::Cancelled);
 }
+
+/// Same as above, with the result taken by another task's `join` instead of `take`.
+#[test]
+fn join_after_another_join_took_the_result_and_a_new_run_began() {
+    let deferred = StaticDeferred::<u32>::new();
+    let mut executor = Executor::new(2);
+    let mut cx = Context::from_waker(noop_waker_ref());
+    let (tx, rx) = oneshot::channel();
+    waiting_join_setup(&deferred, &mut executor, rx);
+
+    let mut join = std::pin::pin!(deferred.join());
+    assert!(join.as_mut().poll(&mut cx).is_pending());
+    tx.send(7).unwrap();
+    executor.run();
+
+    // Another task's `join` gets the result on its first poll, then starts the next run.
+    assert_eq!(block_on(deferred.join()), Ok(7));
+    executor
+        .spawn(deferred.begin().unwrap(), async { 8 })
+        .unwrap();
+    assert_eq!(
+        join.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::NotStarted))
+    );
+}

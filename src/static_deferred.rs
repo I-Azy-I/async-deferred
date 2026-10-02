@@ -130,6 +130,26 @@ impl<T> Shared<T> {
         }
     }
 
+    /// Moves the result out if the run has finished, and records that it was taken, so a
+    /// `join` still waiting for that run reports `NotStarted` rather than `Cancelled`.
+    /// Every way of taking the result goes through here.
+    fn take_result(&mut self) -> Option<T> {
+        match mem::replace(&mut self.phase, Phase::NotStarted) {
+            Phase::Done(value) => {
+                if let Some(awaited) = &mut self.awaited {
+                    if awaited.run == self.run {
+                        awaited.taken = true;
+                    }
+                }
+                Some(value)
+            }
+            other => {
+                self.phase = other;
+                None
+            }
+        }
+    }
+
     fn take_waiter(&mut self) -> Option<Waker> {
         self.waiter.take().map(|waiter| waiter.waker)
     }
@@ -226,22 +246,7 @@ impl<T> StaticDeferred<T> {
     ///
     /// On success, a new run can be started.
     pub fn take(&self) -> Option<T> {
-        self.with(
-            |shared| match mem::replace(&mut shared.phase, Phase::NotStarted) {
-                Phase::Done(value) => {
-                    if let Some(awaited) = &mut shared.awaited {
-                        if awaited.run == shared.run {
-                            awaited.taken = true;
-                        }
-                    }
-                    Some(value)
-                }
-                other => {
-                    shared.phase = other;
-                    None
-                }
-            },
-        )
+        self.with(Shared::take_result)
     }
 
     /// Calls `f` with the result if the run has finished, without moving it out.
@@ -300,9 +305,9 @@ impl<T> StaticDeferred<T> {
                 }
                 Phase::NotStarted => (Poll::Ready(Err(Error::NotStarted)), None),
                 Phase::Cancelled => (Poll::Ready(Err(Error::Cancelled)), None),
-                Phase::Done(_) => match mem::replace(&mut shared.phase, Phase::NotStarted) {
-                    Phase::Done(value) => (Poll::Ready(Ok(value)), None),
-                    _ => unreachable!("matched above"),
+                Phase::Done(_) => match shared.take_result() {
+                    Some(value) => (Poll::Ready(Ok(value)), None),
+                    None => unreachable!("matched above"),
                 },
             });
             wake_other(to_wake);
