@@ -122,6 +122,18 @@ impl Spawner for tokio::runtime::Handle {
     }
 }
 
+/// Spawns on this `LocalSet`. The task only makes progress while the `LocalSet` is run.
+#[cfg(feature = "tokio")]
+impl LocalSpawner for tokio::task::LocalSet {
+    fn spawn_local<F>(&self, task: F) -> Result<(), SpawnError>
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        tokio::task::LocalSet::spawn_local(self, task);
+        Ok(())
+    }
+}
+
 /// Spawns on smol's global executor.
 #[cfg(feature = "smol")]
 #[derive(Debug, Clone, Copy, Default)]
@@ -140,12 +152,25 @@ impl Spawner for Smol {
 
 /// Spawns on this smol executor. The task only makes progress while the executor is run.
 #[cfg(feature = "smol")]
-impl Spawner for smol::Executor<'static> {
+impl<'a> Spawner for smol::Executor<'a> {
     fn spawn<F>(&self, task: F) -> Result<(), SpawnError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
         smol::Executor::spawn(self, task).detach();
+        Ok(())
+    }
+}
+
+/// Spawns on this smol local executor. The task only makes progress while the executor
+/// is run.
+#[cfg(feature = "smol")]
+impl<'a> LocalSpawner for smol::LocalExecutor<'a> {
+    fn spawn_local<F>(&self, task: F) -> Result<(), SpawnError>
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        smol::LocalExecutor::spawn(self, task).detach();
         Ok(())
     }
 }

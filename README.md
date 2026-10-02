@@ -81,6 +81,11 @@ async fn main() {
     // Get the result when ready
     let result = deferred.join().await;
     assert_eq!(result, Ok(&42));
+
+    // Or take ownership of the result: `.await` consumes the Deferred
+    let deferred = Deferred::start(async { String::from("owned") });
+    let value: String = deferred.await.unwrap();
+    assert_eq!(value, "owned");
 }
 ```
 
@@ -127,8 +132,8 @@ Tasks are started through a spawner, which hands them to an async runtime.
 
 | Feature | Spawner | Notes |
 |---|---|---|
-| `tokio` (default) | `Tokio`, `tokio::runtime::Handle` | Enables the `start` and `begin` shortcuts used above |
-| `smol` | `Smol`, `smol::Executor<'static>` | |
+| `tokio` (default) | `Tokio`, `tokio::runtime::Handle`, `tokio::task::LocalSet` (local) | Enables the `start` and `begin` shortcuts used above |
+| `smol` | `Smol`, `smol::Executor`, `smol::LocalExecutor` (local) | |
 | `std` (default) | | Catches panics in the task and callback. Without it, the crate is `no_std` + `alloc` |
 
 To use another runtime without pulling in Tokio:

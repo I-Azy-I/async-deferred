@@ -162,3 +162,25 @@ fn begin_outside_runtime_returns_error_and_stays_not_started() {
     );
     assert_eq!(deferred.state(), State::NotStarted);
 }
+
+#[tokio::test]
+async fn await_deferred_directly() {
+    let deferred = Deferred::start(async { String::from("done") });
+    assert_eq!(deferred.await, Ok(String::from("done")));
+}
+
+#[tokio::test]
+async fn local_set_runs_non_send_future() {
+    let local = tokio::task::LocalSet::new();
+    let shared = std::rc::Rc::new(41);
+    let deferred = Deferred::start_local_on(&local, async move { *shared + 1 }).unwrap();
+    assert_eq!(local.run_until(deferred.into_result()).await, Ok(42));
+}
+
+#[test]
+fn dropped_local_set_reports_cancelled() {
+    let local = tokio::task::LocalSet::new();
+    let mut deferred = Deferred::start_local_on(&local, std::future::pending::<u32>()).unwrap();
+    drop(local);
+    assert!(deferred.is_cancelled());
+}

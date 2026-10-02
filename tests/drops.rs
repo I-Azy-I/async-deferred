@@ -52,6 +52,19 @@ fn result_moved_out_by_take() {
 }
 
 #[test]
+fn result_moved_out_by_into_result() {
+    let tracker = DropTracker::default();
+    let spawner = JoiningSpawner::default();
+    let t = tracker.clone();
+    let deferred = Deferred::start_on(&spawner, async move { t.track(1) }).unwrap();
+    let value = block_on(deferred.into_result()).unwrap();
+    assert_eq!(tracker.dropped(), 0);
+    drop(value);
+    spawner.wait_all();
+    tracker.assert_all_dropped_once();
+}
+
+#[test]
 fn result_dropped_with_deferred() {
     let tracker = DropTracker::default();
     let spawner = JoiningSpawner::default();

@@ -30,6 +30,11 @@
 - `Spawner` is implemented for `&S`, `&mut S`, `Box<S>` and `Arc<S>`, and `LocalSpawner` also
   for `Rc<S>`, where `S` is a spawner.
 - `rust-version = "1.65"`, checked in CI.
+- `into_result` and `.await` on a `Deferred` (it implements `IntoFuture`) wait for the task
+  and return the owned result: `Result<T, Error>`.
+- `has_callback_panicked` and `is_cancelled`, so every `State` has an `is_*` helper.
+- `LocalSpawner` for `tokio::task::LocalSet` and `smol::LocalExecutor`.
+- `Spawner` for any `smol::Executor<'a>`, not only `Executor<'static>`.
 
 ### Fixed
 

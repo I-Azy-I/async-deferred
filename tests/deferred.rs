@@ -21,6 +21,11 @@ fn assert_state<T: std::fmt::Debug + PartialEq>(deferred: &mut Deferred<T>, expe
         deferred.has_task_panicked(),
         expected == State::TaskPanicked
     );
+    assert_eq!(
+        deferred.has_callback_panicked(),
+        expected == State::CallbackPanicked
+    );
+    assert_eq!(deferred.is_cancelled(), expected == State::Cancelled);
     let has_value = matches!(expected, State::Completed | State::CallbackPanicked);
     assert_eq!(deferred.is_ready(), has_value);
     assert_eq!(deferred.try_get().is_some(), has_value);
@@ -117,6 +122,58 @@ fn begin_is_rejected_until_result_is_taken() {
 fn non_sync_result() {
     let mut deferred = Deferred::start_on(&ThreadSpawner, async { Cell::new(42) }).unwrap();
     assert_eq!(block_on(deferred.join()).map(Cell::get), Ok(42));
+}
+
+// --- owned result ---
+
+#[test]
+fn into_result_returns_the_owned_value() {
+    let deferred = Deferred::start_on(&ThreadSpawner, async { vec![1, 2, 3] }).unwrap();
+    assert_eq!(block_on(deferred.into_result()), Ok(vec![1, 2, 3]));
+}
+
+#[test]
+fn await_deferred_directly() {
+    let deferred = Deferred::start_on(&ThreadSpawner, async { 42 }).unwrap();
+    assert_eq!(block_on(async { deferred.await }), Ok(42));
+}
+
+#[test]
+fn into_result_after_join() {
+    let mut deferred = Deferred::start_on(&ThreadSpawner, async { 42 }).unwrap();
+    block_on(deferred.join()).unwrap();
+    assert_eq!(block_on(deferred.into_result()), Ok(42));
+}
+
+#[test]
+fn into_result_not_started_and_taken() {
+    let unstarted: Deferred<u32> = Deferred::new();
+    assert_eq!(block_on(unstarted.into_result()), Err(Error::NotStarted));
+
+    let mut taken = Deferred::start_on(&ThreadSpawner, async { 42 }).unwrap();
+    block_on(taken.join()).unwrap();
+    taken.take();
+    assert_eq!(block_on(taken.into_result()), Err(Error::NotStarted));
+}
+
+#[test]
+fn into_result_task_dropped_by_runtime() {
+    let deferred = Deferred::start_on(&DroppingSpawner, async { 42 }).unwrap();
+    assert_eq!(block_on(deferred.into_result()), Err(Error::Cancelled));
+}
+
+#[test]
+fn dropping_into_result_keeps_task_running() {
+    let (start_tx, start_rx) = oneshot::channel::<()>();
+    let (done_tx, done_rx) = oneshot::channel();
+    let deferred = Deferred::start_on(&ThreadSpawner, async move {
+        start_rx.await.unwrap();
+        done_tx.send(42).unwrap();
+    })
+    .unwrap();
+    assert!(deferred.into_result().now_or_never().is_none());
+    start_tx.send(()).unwrap();
+    assert_eq!(block_on(done_rx), Ok(42));
 }
 
 // --- take ---
@@ -412,6 +469,24 @@ mod panics {
         assert_state(&mut deferred, State::CallbackPanicked);
         assert_eq!(deferred.panic_message(), Some("the callback panicked"));
         assert_eq!(block_on(deferred.join()), Ok(&42));
+    }
+
+    #[test]
+    fn into_result_after_task_panic() {
+        let deferred: Deferred<u32> =
+            Deferred::start_on(&ThreadSpawner, async { panic!("boom") }).unwrap();
+        assert_eq!(
+            block_on(deferred.into_result()),
+            Err(Error::Panicked("boom".into()))
+        );
+    }
+
+    #[test]
+    fn into_result_after_callback_panic_returns_value() {
+        let deferred =
+            Deferred::start_with_callback_on(&ThreadSpawner, async { 42 }, |_| panic!("boom"))
+                .unwrap();
+        assert_eq!(block_on(deferred.into_result()), Ok(42));
     }
 
     #[test]

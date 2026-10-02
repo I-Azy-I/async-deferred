@@ -61,6 +61,16 @@ mod tests {
     }
 
     #[test]
+    async fn await_deferred_directly() {
+        let deferred = Deferred::start_local_on(&embassy().await, async {
+            sleep_ms(10).await;
+            Rc::new(42u32)
+        })
+        .unwrap();
+        assert!(deferred.await.map(|v| *v) == Ok(42));
+    }
+
+    #[test]
     async fn pending_then_ready_without_join() {
         let mut deferred = Deferred::start_local_on(&embassy().await, async {
             sleep_ms(50).await;

@@ -45,6 +45,8 @@ enum Op {
     State,
     Join,
     PanicMessage,
+    /// Consumes the `Deferred` with `into_result`, then continues with a new one.
+    IntoResult,
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -66,6 +68,7 @@ fn op() -> impl Strategy<Value = Op> {
         1 => Just(Op::State),
         2 => Just(Op::Join),
         1 => Just(Op::PanicMessage),
+        1 => Just(Op::IntoResult),
     ]
 }
 
@@ -344,6 +347,21 @@ fn run_ops(ops: &[Op]) -> Result<(), TestCaseError> {
                     prop_assert_eq!(joined, Some(model.join()), "join");
                 }
             }
+            Op::IntoResult => {
+                let owned = std::mem::take(&mut deferred);
+                let mut future = owned.into_result();
+                let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+                let polled = Pin::new(&mut future).poll(&mut cx);
+                if matches!(model, Model::Running(_)) {
+                    prop_assert!(polled.is_pending(), "into_result should wait");
+                    // Dropping the future leaves the task running on its own.
+                    drop(future);
+                    running = None;
+                } else {
+                    prop_assert_eq!(polled, Poll::Ready(model.join()), "into_result");
+                }
+                model = Model::NotStarted;
+            }
             Op::PanicMessage => {
                 prop_assert_eq!(
                     deferred.panic_message(),
@@ -422,9 +440,20 @@ fn every_state_is_reached() {
         Op::Panic,
         Op::PanicMessage,
         Op::Join,
+        Op::IntoResult,
+        Op::Begin(Callback::None),
+        Op::IntoResult,
+        Op::Begin(Callback::None),
+        Op::Finish(3),
+        Op::IntoResult,
     ];
     run_ops(&ops).unwrap();
 
-    let ops = [Op::Begin(Callback::None), Op::RuntimeDrop, Op::Join];
+    let ops = [
+        Op::Begin(Callback::None),
+        Op::RuntimeDrop,
+        Op::Join,
+        Op::IntoResult,
+    ];
     run_ops(&ops).unwrap();
 }

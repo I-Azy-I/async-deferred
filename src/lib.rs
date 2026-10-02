@@ -13,7 +13,9 @@ pub mod __private {
 
 use alloc::string::String;
 use core::fmt;
-use core::future::Future;
+use core::future::{Future, IntoFuture};
+use core::pin::Pin;
+use core::task::{Context, Poll};
 
 use futures_channel::oneshot;
 use futures_util::future::{AbortHandle, Abortable};
@@ -395,6 +397,29 @@ impl<T> Deferred<T> {
         }
     }
 
+    /// Waits for the task to finish and returns its result, consuming the `Deferred`.
+    ///
+    /// Same as `.await` on the `Deferred`. If the task finished but its callback panicked,
+    /// the result is still returned. Dropping the returned future before it finishes does
+    /// not stop the task.
+    ///
+    /// ```rust
+    /// use async_deferred::Deferred;
+    ///
+    /// # tokio_test::block_on(async {
+    /// let deferred = Deferred::start(async { String::from("done") });
+    /// let value: String = deferred.into_result().await.unwrap();
+    /// assert_eq!(value, "done");
+    ///
+    /// // `.await` on a `Deferred` does the same
+    /// let deferred = Deferred::start(async { 42 });
+    /// assert_eq!(deferred.await, Ok(42));
+    /// # })
+    /// ```
+    pub fn into_result(self) -> IntoResult<T> {
+        IntoResult { deferred: self }
+    }
+
     /// Returns the current [`State`] without waiting.
     pub fn state(&mut self) -> State {
         self.poll_task();
@@ -552,6 +577,19 @@ impl<T> Deferred<T> {
     pub fn has_task_panicked(&mut self) -> bool {
         self.state() == State::TaskPanicked
     }
+
+    /// Returns `true` if the task finished but its callback panicked.
+    pub fn has_callback_panicked(&mut self) -> bool {
+        self.state() == State::CallbackPanicked
+    }
+
+    /// Returns `true` if the runtime dropped the task before it finished.
+    ///
+    /// A task stopped with [`cancel`](Self::cancel) is not reported here: cancelling resets
+    /// the `Deferred` to [`State::NotStarted`].
+    pub fn is_cancelled(&mut self) -> bool {
+        self.state() == State::Cancelled
+    }
 }
 
 #[cfg(feature = "tokio")]
@@ -638,6 +676,47 @@ impl<T> Deferred<T> {
         T: Send + 'static,
     {
         self.begin_with_callback_on(&Tokio, future, callback)
+    }
+}
+
+impl<T> IntoFuture for Deferred<T> {
+    type Output = Result<T, Error>;
+    type IntoFuture = IntoResult<T>;
+
+    /// Same as [`Deferred::into_result`].
+    fn into_future(self) -> IntoResult<T> {
+        self.into_result()
+    }
+}
+
+/// The future returned by [`Deferred::into_result`] and by `.await` on a [`Deferred`].
+#[derive(Debug)]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct IntoResult<T> {
+    deferred: Deferred<T>,
+}
+
+// The value is never pinned: it is only moved out once the task has finished.
+impl<T> Unpin for IntoResult<T> {}
+
+impl<T> Future for IntoResult<T> {
+    type Output = Result<T, Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = &mut self.get_mut().deferred.inner;
+        if let Inner::Running { receiver, .. } = inner {
+            match Pin::new(receiver).poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(outcome) => *inner = Inner::finished(outcome.ok()),
+            }
+        }
+        Poll::Ready(match core::mem::replace(inner, Inner::NotStarted) {
+            Inner::Done { value, .. } => Ok(value),
+            Inner::Panicked(msg) => Err(Error::Panicked(msg)),
+            Inner::Cancelled => Err(Error::Cancelled),
+            Inner::NotStarted => Err(Error::NotStarted),
+            Inner::Running { .. } => unreachable!("the task was polled above"),
+        })
     }
 }
 
