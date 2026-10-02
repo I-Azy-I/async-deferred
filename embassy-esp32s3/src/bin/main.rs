@@ -34,8 +34,8 @@ extern crate alloc;
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
 
-// Lets up to 4 `Deferred` tasks run at the same time.
-embassy_spawner!(DeferredSpawner, pool_size = 4);
+// One measurement runs at a time, so one task slot is enough.
+embassy_spawner!(DeferredSpawner, pool_size = 1);
 
 /// Gives up on a measurement that takes longer than this.
 const MEASUREMENT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -68,7 +68,8 @@ async fn main(spawner: Spawner) -> ! {
     let mut n = 0;
     let mut measurement = Deferred::start_with_callback_local_on(&spawner, measure(n), |v| {
         info!("measurement finished: {}", v)
-    });
+    })
+    .expect("the task pool is empty at startup");
     let mut started = Instant::now();
 
     loop {
@@ -79,17 +80,21 @@ async fn main(spawner: Spawner) -> ! {
         if let Some(value) = measurement.take() {
             info!("#{}: {} °C after {} ms", n, value, started.elapsed().as_millis());
         } else if started.elapsed() > MEASUREMENT_TIMEOUT {
-            measurement.cancel();
+            // Wait until the hung task has stopped, so its pool slot is free again.
+            measurement.cancel_and_wait().await;
             warn!("#{}: no answer after {} ms, cancelled", n, started.elapsed().as_millis());
         } else {
             continue;
         }
 
-        // `take` and `cancel` reset the `Deferred`, so it can start the next measurement.
+        // `take` and `cancel_and_wait` reset the `Deferred`, so it can start the next one.
         n += 1;
-        measurement.begin_with_callback_local_on(&spawner, measure(n), |v| {
+        let begun = measurement.begin_with_callback_local_on(&spawner, measure(n), |v| {
             info!("measurement finished: {}", v)
         });
+        if begun.is_err() {
+            error!("#{}: could not start the measurement", n);
+        }
         started = Instant::now();
     }
 }
