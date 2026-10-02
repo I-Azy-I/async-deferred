@@ -216,3 +216,6 @@ The futures can hold values that are not `Send`, such as `Rc` or peripheral driv
 Starting more than `pool_size` tasks at the same time panics.
 Without the `std` feature, panics are not caught, so `TaskPanicked` and `CallbackPanicked`
 are never reported. On embedded targets a panic usually halts the device anyway.
+
+A complete example for the ESP32-S3, with tests that run on the chip, is in
+[`embassy-esp32s3/`](https://github.com/I-Azy-I/async-deferred/tree/main/embassy-esp32s3).

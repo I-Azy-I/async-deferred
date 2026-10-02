@@ -11,6 +11,7 @@ categories = ["asynchronous", "concurrency", "data-structures", "no-std", "embed
 keywords = ["async", "deferred", "task", "utility", "tokio"]
 documentation = "https://docs.rs/async-deferred"
 homepage = "https://github.com/I-Azy-I/async-deferred"
+exclude = ["embassy-esp32s3"]
 
 [features]
 default = ["std", "tokio"]
