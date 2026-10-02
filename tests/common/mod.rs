@@ -161,7 +161,7 @@ impl SlotPool {
 
     /// Polls every task once, freeing the slots of finished tasks.
     pub fn run_once(&self) {
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
         let count = self.slots.borrow().len();
         for i in 0..count {
             let task = self.slots.borrow_mut()[i].take();
@@ -175,7 +175,7 @@ impl SlotPool {
 
     /// Runs `future` and the pool's tasks until `future` finishes.
     pub fn run_until<F: Future>(&self, future: F) -> F::Output {
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
         let mut future = std::pin::pin!(future);
         for _ in 0..10_000 {
             if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {

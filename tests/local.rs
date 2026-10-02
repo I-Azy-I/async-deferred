@@ -22,6 +22,14 @@ fn start_local_on_runs_non_send_future() {
 }
 
 #[test]
+fn local_spawner_behind_a_pointer() {
+    let mut pool = LocalPool::new();
+    let spawner = Rc::new(PoolSpawner(pool.spawner()));
+    let mut deferred = Deferred::start_local_on(&spawner, async { 42 }).unwrap();
+    assert_eq!(pool.run_until(deferred.join()), Ok(&42));
+}
+
+#[test]
 fn non_send_result() {
     let mut pool = LocalPool::new();
     let mut deferred =

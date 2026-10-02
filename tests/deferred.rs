@@ -67,6 +67,16 @@ fn begin_on_starts_an_empty_deferred() {
 }
 
 #[test]
+fn spawner_behind_a_reference_or_pointer() {
+    let mut by_ref = Deferred::start_on(&&ThreadSpawner, async { 1 }).unwrap();
+    let mut boxed = Deferred::start_on(&Box::new(ThreadSpawner), async { 2 }).unwrap();
+    let mut shared = Deferred::start_on(&Arc::new(ThreadSpawner), async { 3 }).unwrap();
+    assert_eq!(block_on(by_ref.join()), Ok(&1));
+    assert_eq!(block_on(boxed.join()), Ok(&2));
+    assert_eq!(block_on(shared.join()), Ok(&3));
+}
+
+#[test]
 fn result_available_without_join() {
     let mut deferred = Deferred::start_on(&ThreadSpawner, async { 42 }).unwrap();
     wait_until_finished(&mut deferred);
@@ -292,6 +302,14 @@ fn task_dropped_by_runtime_reports_cancelled() {
 }
 
 #[test]
+fn restart_after_task_dropped_by_runtime() {
+    let mut deferred = Deferred::start_on(&DroppingSpawner, async { 1 }).unwrap();
+    assert_eq!(deferred.state(), State::Cancelled);
+    assert_eq!(deferred.begin_on(&ThreadSpawner, async { 2 }), Ok(()));
+    assert_eq!(block_on(deferred.join()), Ok(&2));
+}
+
+#[test]
 fn task_dropped_by_runtime_does_not_run_callback() {
     let ran = Flag::default();
     let ran_in_callback = ran.clone();
@@ -362,6 +380,16 @@ mod panics {
             .unwrap();
         block_on(deferred.join()).unwrap_err();
         assert!(!ran.is_set());
+    }
+
+    #[test]
+    fn restart_after_task_panic() {
+        let mut deferred: Deferred<u32> =
+            Deferred::start_on(&ThreadSpawner, async { panic!("boom") }).unwrap();
+        block_on(deferred.join()).unwrap_err();
+        assert_eq!(deferred.begin_on(&ThreadSpawner, async { 2 }), Ok(()));
+        assert_eq!(deferred.panic_message(), None);
+        assert_eq!(block_on(deferred.join()), Ok(&2));
     }
 
     #[test]

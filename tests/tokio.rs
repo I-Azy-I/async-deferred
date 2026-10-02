@@ -3,7 +3,7 @@
 
 mod common;
 
-use async_deferred::{BeginError, Deferred, Error, State, Tokio};
+use async_deferred::{BeginError, Deferred, Error, SpawnError, State, Tokio};
 use common::{pending_until_dropped, Flag};
 use tokio::sync::oneshot;
 
@@ -134,11 +134,31 @@ fn start_outside_runtime_panics() {
 }
 
 #[test]
-fn begin_outside_runtime_panics_and_stays_not_started() {
-    let mut deferred = Deferred::new();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = deferred.begin(async { 42 });
-    }));
+fn start_with_callback_outside_runtime_panics() {
+    let result = std::panic::catch_unwind(|| Deferred::start_with_callback(async { 42 }, |_| {}));
     assert!(result.is_err());
+}
+
+const NO_RUNTIME: SpawnError = SpawnError::new("not inside a Tokio runtime");
+
+#[test]
+fn start_on_tokio_outside_runtime_returns_error() {
+    assert_eq!(
+        Deferred::start_on(&Tokio, async { 42 }).err(),
+        Some(NO_RUNTIME)
+    );
+}
+
+#[test]
+fn begin_outside_runtime_returns_error_and_stays_not_started() {
+    let mut deferred = Deferred::new();
+    assert_eq!(
+        deferred.begin(async { 42 }),
+        Err(BeginError::Spawn(NO_RUNTIME))
+    );
+    assert_eq!(
+        deferred.begin_with_callback(async { 42 }, |_| {}),
+        Err(BeginError::Spawn(NO_RUNTIME))
+    );
     assert_eq!(deferred.state(), State::NotStarted);
 }

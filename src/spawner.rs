@@ -55,9 +55,44 @@ pub trait LocalSpawner {
         F: Future<Output = ()> + 'static;
 }
 
+macro_rules! forward_spawner {
+    ($($pointer:ty),*) => {$(
+        impl<S: Spawner + ?Sized> Spawner for $pointer {
+            fn spawn<F>(&self, task: F) -> Result<(), SpawnError>
+            where
+                F: Future<Output = ()> + Send + 'static,
+            {
+                (**self).spawn(task)
+            }
+        }
+    )*};
+}
+
+macro_rules! forward_local_spawner {
+    ($($pointer:ty),*) => {$(
+        impl<S: LocalSpawner + ?Sized> LocalSpawner for $pointer {
+            fn spawn_local<F>(&self, task: F) -> Result<(), SpawnError>
+            where
+                F: Future<Output = ()> + 'static,
+            {
+                (**self).spawn_local(task)
+            }
+        }
+    )*};
+}
+
+forward_spawner!(&S, &mut S, alloc::boxed::Box<S>);
+forward_local_spawner!(&S, &mut S, alloc::boxed::Box<S>, alloc::rc::Rc<S>);
+
+#[cfg(target_has_atomic = "ptr")]
+forward_spawner!(alloc::sync::Arc<S>);
+#[cfg(target_has_atomic = "ptr")]
+forward_local_spawner!(alloc::sync::Arc<S>);
+
 /// Spawns on the current Tokio runtime.
 ///
-/// Spawning panics outside a Tokio runtime. Use a [`tokio::runtime::Handle`] there.
+/// Spawning outside a Tokio runtime returns a [`SpawnError`]. Use a
+/// [`tokio::runtime::Handle`] to spawn from outside one.
 #[cfg(feature = "tokio")]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Tokio;
@@ -68,7 +103,9 @@ impl Spawner for Tokio {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        tokio::spawn(task);
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| SpawnError::new("not inside a Tokio runtime"))?;
+        handle.spawn(task);
         Ok(())
     }
 }

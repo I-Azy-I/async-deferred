@@ -30,6 +30,7 @@ type Outcome<T> = Result<(T, Option<String>), String>;
 
 /// The state of a [`Deferred`] task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum State {
     /// No task has been started, or its result was taken.
     NotStarted,
@@ -52,6 +53,7 @@ pub enum State {
 
 /// Why [`Deferred::join`] has no result.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// No task has been started, or its result was taken.
     NotStarted,
@@ -103,8 +105,9 @@ impl std::error::Error for SpawnError {}
 
 /// Why a `begin` method did not start a task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BeginError {
-    /// A task was already started and its result has not been taken.
+    /// A task is running, or its result has not been taken yet.
     AlreadyStarted,
     /// The runtime could not start the task.
     Spawn(SpawnError),
@@ -119,7 +122,9 @@ impl From<SpawnError> for BeginError {
 impl fmt::Display for BeginError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BeginError::AlreadyStarted => f.write_str("a task was already started"),
+            BeginError::AlreadyStarted => {
+                f.write_str("a task is running or its result has not been taken")
+            }
             BeginError::Spawn(err) => err.fmt(f),
         }
     }
@@ -217,7 +222,8 @@ impl<T> Deferred<T> {
     /// Like [`start_on`](Self::start_on), and runs `callback` with the result once
     /// `future` finishes.
     ///
-    /// The callback is not run if `future` panics.
+    /// The callback is not run if `future` panics, or if the task is cancelled or dropped by
+    /// the runtime.
     pub fn start_with_callback_on<S, F, C>(
         spawner: &S,
         future: F,
@@ -238,8 +244,9 @@ impl<T> Deferred<T> {
 
     /// Spawns `future` with `spawner`.
     ///
-    /// Returns an error and does nothing if a task was already started and its result
-    /// has not been taken, or if the runtime could not start the task.
+    /// Returns an error and does nothing if a task is running or its result has not been
+    /// taken, or if the runtime could not start the task. A task that panicked or was
+    /// dropped by the runtime does not prevent starting a new one.
     pub fn begin_on<S, F>(&mut self, spawner: &S, future: F) -> Result<(), BeginError>
     where
         S: Spawner,
@@ -252,7 +259,8 @@ impl<T> Deferred<T> {
     /// Like [`begin_on`](Self::begin_on), and runs `callback` with the result once
     /// `future` finishes.
     ///
-    /// The callback is not run if `future` panics.
+    /// The callback is not run if `future` panics, or if the task is cancelled or dropped by
+    /// the runtime.
     pub fn begin_with_callback_on<S, F, C>(
         &mut self,
         spawner: &S,
@@ -265,7 +273,7 @@ impl<T> Deferred<T> {
         C: FnOnce(&T) + Send + 'static,
         T: Send + 'static,
     {
-        if !self.is_not_started() {
+        if self.is_busy() {
             return Err(BeginError::AlreadyStarted);
         }
         let (task, running) = task(future, callback);
@@ -332,13 +340,19 @@ impl<T> Deferred<T> {
         C: FnOnce(&T) + 'static,
         T: 'static,
     {
-        if !self.is_not_started() {
+        if self.is_busy() {
             return Err(BeginError::AlreadyStarted);
         }
         let (task, running) = task(future, callback);
         spawner.spawn_local(task)?;
         self.inner = running;
         Ok(())
+    }
+
+    /// Whether a task is running or its result is waiting to be taken.
+    fn is_busy(&mut self) -> bool {
+        self.poll_task();
+        matches!(self.inner, Inner::Running { .. } | Inner::Done { .. })
     }
 
     /// If the task has finished, stores its outcome. Never waits.
@@ -401,6 +415,9 @@ impl<T> Deferred<T> {
     }
 
     /// Returns the panic message if the task or its callback panicked.
+    ///
+    /// Catching a panic does not silence it: the panic hook still reports it, as for any
+    /// other panic.
     pub fn panic_message(&mut self) -> Option<&str> {
         self.poll_task();
         match &self.inner {
@@ -454,6 +471,9 @@ impl<T> Deferred<T> {
     /// [`cancel_and_wait`](Self::cancel_and_wait) to wait until it has stopped.
     /// Returns `false` and does nothing if no task is running.
     ///
+    /// Cancelling is cooperative: the task stops at its next `.await`. Code that blocks
+    /// without awaiting keeps running until it reaches one.
+    ///
     /// ```rust
     /// use async_deferred::{Deferred, State};
     ///
@@ -473,11 +493,15 @@ impl<T> Deferred<T> {
         true
     }
 
-    /// Like [`cancel`](Self::cancel), and waits until the task has stopped.
+    /// Like [`cancel`](Self::cancel), and waits until the task has stopped: its future has
+    /// been dropped.
     ///
-    /// Once this returns, the task no longer holds its runtime resources, so a new task
-    /// can be started even on a runtime with a single free slot.
-    /// Returns `false` and does nothing if no task is running.
+    /// On a single-threaded executor such as embassy, the task has also freed its slot when
+    /// this returns, so a new task can start even in a full task pool. On a multi-threaded
+    /// runtime, the runtime may still be finishing its own bookkeeping for the task.
+    ///
+    /// The task stops the next time the runtime runs it, so this never returns if nothing
+    /// is running the executor. Returns `false` and does nothing if no task is running.
     ///
     /// ```rust
     /// use async_deferred::{Deferred, State};
@@ -543,12 +567,20 @@ impl<T> Deferred<T> {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        Self::start_on(&Tokio, future).expect("the Tokio spawner never fails")
+        Self::start_on(&Tokio, future)
+            .expect("`Deferred::start` was called outside a Tokio runtime")
     }
 
     /// Like [`start`](Self::start), and runs `callback` with the result once `future` finishes.
     ///
-    /// The callback is not run if `future` panics.
+    /// The callback is not run if `future` panics, or if the task is cancelled or dropped by
+    /// the runtime.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a Tokio runtime. Use
+    /// [`start_with_callback_on`](Self::start_with_callback_on) with a
+    /// [`tokio::runtime::Handle`] there.
     ///
     /// ```rust
     /// use async_deferred::Deferred;
@@ -567,17 +599,16 @@ impl<T> Deferred<T> {
         T: Send + 'static,
     {
         Self::start_with_callback_on(&Tokio, future, callback)
-            .expect("the Tokio spawner never fails")
+            .expect("`Deferred::start_with_callback` was called outside a Tokio runtime")
     }
 
     /// Spawns `future` on the current Tokio runtime.
     ///
-    /// Returns [`BeginError::AlreadyStarted`] and does nothing if a task was already
-    /// started and its result has not been taken.
+    /// Returns [`BeginError::AlreadyStarted`] and does nothing if a task is running or its
+    /// result has not been taken. A task that panicked or was dropped by the runtime does
+    /// not prevent starting a new one.
     ///
-    /// # Panics
-    ///
-    /// Panics if called outside a Tokio runtime.
+    /// Outside a Tokio runtime, returns [`BeginError::Spawn`].
     ///
     /// ```rust
     /// use async_deferred::Deferred;
@@ -598,7 +629,8 @@ impl<T> Deferred<T> {
 
     /// Like [`begin`](Self::begin), and runs `callback` with the result once `future` finishes.
     ///
-    /// The callback is not run if `future` panics.
+    /// The callback is not run if `future` panics, or if the task is cancelled or dropped by
+    /// the runtime.
     pub fn begin_with_callback<F, C>(&mut self, future: F, callback: C) -> Result<(), BeginError>
     where
         F: Future<Output = T> + Send + 'static,

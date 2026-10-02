@@ -11,7 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Once;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 
 use async_deferred::{BeginError, Deferred, Error, LocalSpawner, SpawnError, State};
 use futures_channel::oneshot;
@@ -81,6 +81,11 @@ enum Model {
 }
 
 impl Model {
+    /// A new task can start unless one is running or a result is waiting to be taken.
+    fn can_begin(&self) -> bool {
+        matches!(self, Model::NotStarted | Model::Panicked | Model::Cancelled)
+    }
+
     fn state(&self) -> State {
         match self {
             Model::NotStarted => State::NotStarted,
@@ -160,7 +165,7 @@ impl LocalSpawner for Manual {
 impl Manual {
     /// Polls every unfinished task once.
     fn run(&self) {
-        let mut cx = Context::from_waker(Waker::noop());
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
         let count = self.tasks.borrow().len();
         for i in 0..count {
             let task = self.tasks.borrow_mut()[i].take();
@@ -239,7 +244,7 @@ fn run_ops(ops: &[Op]) -> Result<(), TestCaseError> {
                     }
                 };
                 executor.refuse.set(false);
-                let expected = if model != Model::NotStarted {
+                let expected = if !model.can_begin() {
                     Err(BeginError::AlreadyStarted)
                 } else if refused {
                     Err(BeginError::Spawn(REFUSED))
@@ -297,7 +302,7 @@ fn run_ops(ops: &[Op]) -> Result<(), TestCaseError> {
             }
             Op::CancelAndWait => {
                 let was_running = running.as_ref().map(|task| task.index);
-                let mut cx = Context::from_waker(Waker::noop());
+                let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
                 let mut wait = std::pin::pin!(deferred.cancel_and_wait());
                 let mut result = wait.as_mut().poll(&mut cx);
                 if result.is_pending() {

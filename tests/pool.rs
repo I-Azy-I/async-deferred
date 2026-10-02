@@ -122,6 +122,6 @@ fn errors_display() {
     );
     assert_eq!(
         BeginError::AlreadyStarted.to_string(),
-        "a task was already started"
+        "a task is running or its result has not been taken"
     );
 }

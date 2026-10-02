@@ -12,22 +12,33 @@
 - `begin`, `begin_on`, `begin_local_on` and their callback variants return
   `Result<(), BeginError>` instead of `bool`: `BeginError::AlreadyStarted` replaces `false`,
   and `BeginError::Spawn` reports a refused task.
+- `begin` can now start a new task after the previous one panicked or was dropped by the
+  runtime. Before, the `Deferred` stayed stuck in `TaskPanicked` or `Cancelled`.
+  `AlreadyStarted` now only means a task is running or its result has not been taken.
+- The `Tokio` spawner returns a `SpawnError` outside a Tokio runtime instead of panicking,
+  so `begin` and `begin_with_callback` return an error there. `start` and
+  `start_with_callback` still return `Deferred<T>` directly, and panic outside a runtime.
 - `embassy_spawner!` spawners return a `SpawnError` when all `pool_size` tasks are running,
   instead of panicking.
-
-`start` and `start_with_callback` (Tokio) still return `Deferred<T>` directly: Tokio never
-refuses a task.
+- `State`, `Error` and `BeginError` are `#[non_exhaustive]`: a `match` on them needs a
+  wildcard arm, so variants can be added later without a breaking change.
 
 ### Added
 
-- `cancel_and_wait` cancels the task and waits until it has stopped, so the runtime has
-  freed its resources (such as an embassy task pool slot) when it returns.
+- `cancel_and_wait` cancels the task and waits until its future has been dropped. On a
+  single-threaded executor such as embassy, its task pool slot is free when it returns.
+- `Spawner` is implemented for `&S`, `&mut S`, `Box<S>` and `Arc<S>`, and `LocalSpawner` also
+  for `Rc<S>`, where `S` is a spawner.
+- `rust-version = "1.65"`, checked in CI.
 
 ### Fixed
 
 - Restarting right after `cancel` in a full embassy task pool panicked, because the
   cancelled task keeps its slot until the executor runs it again. Use `cancel_and_wait`
   before restarting, or handle the `SpawnError` that `begin` now returns.
+- The docs now say that callbacks don't run when the task is cancelled or dropped by the
+  runtime, that cancelling is cooperative, and that caught panics are still reported by
+  the panic hook.
 
 ## 0.3.0
 
