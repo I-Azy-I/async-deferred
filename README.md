@@ -228,4 +228,4 @@ A complete example for the ESP32-S3, with tests that run on the chip, is in
 
 ## License
 
-Licensed under the MIT license.
+Licensed under the [MIT license](LICENSE).
