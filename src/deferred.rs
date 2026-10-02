@@ -370,9 +370,9 @@ impl<T> Deferred<T> {
 
     /// Stops a running task and resets the `Deferred` so it can start a new one.
     ///
-    /// The task stops the next time the runtime polls it, so it may still hold its runtime
-    /// resources, such as an embassy task pool slot, when this returns. Use
-    /// [`cancel_and_wait`](Self::cancel_and_wait) to wait until it has stopped.
+    /// The task may still be using its runtime resources, such as an embassy task pool slot,
+    /// when this returns. To start a new task right away in a full task pool, use
+    /// [`cancel_and_wait`](Self::cancel_and_wait) instead.
     /// Returns `false` and does nothing if no task is running.
     ///
     /// Cancelling is cooperative: the task stops at its next `.await`. Code that blocks
@@ -401,15 +401,12 @@ impl<T> Deferred<T> {
         true
     }
 
-    /// Like [`cancel`](Self::cancel), and waits until the task has stopped: its future has
-    /// been dropped.
+    /// Like [`cancel`](Self::cancel), and waits until the task has stopped.
     ///
-    /// On a single-threaded executor such as embassy, the task has also freed its slot when
-    /// this returns, so a new task can start even in a full task pool. On a multi-threaded
-    /// runtime, the runtime may still be finishing its own bookkeeping for the task.
-    ///
-    /// The task stops the next time the runtime runs it, so this never returns if nothing
-    /// is running the executor. Returns `false` and does nothing if no task is running.
+    /// On a single-threaded executor such as embassy, its task pool slot is free when this
+    /// returns, so a new task can start right away even in a full pool. The task only stops
+    /// while its runtime is running, so don't await this from code that blocks the runtime.
+    /// Returns `false` and does nothing if no task is running.
     ///
     /// ```rust
     /// use async_deferred::{Deferred, State};

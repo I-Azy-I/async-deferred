@@ -24,14 +24,10 @@ use crate::{BeginError, Error, State};
 /// such as `std`, the `StaticDeferred` then reports [`State::Cancelled`].
 ///
 /// Wait on it ([`join`](Self::join) or [`cancel_and_wait`](Self::cancel_and_wait)) from one
-/// task at a time. A single waiting task is only woken when something changes, even if its
-/// executor gives it a new waker on each poll or waits on it twice, as with `join!` or
-/// `select!`. In that last case the check relies on [`Waker::will_wake`], which is best
-/// effort, so an executor whose wakers it can't match may still see extra wake-ups.
-/// Several waiting tasks still all finish, but they keep waking each other until then, which
-/// costs CPU time, and a `join` that ends without a result may report [`Error::Cancelled`]
-/// where [`Error::NotStarted`] would be accurate. A `join` that returns `Ok` always has the
-/// result of the run it waited for.
+/// task at a time; waiting twice from the same task, for example with `join!`, is fine.
+/// Waiting from several tasks at once also works, but uses more CPU while they wait, and a
+/// `join` that ends without a result may then report [`Error::Cancelled`] instead of
+/// [`Error::NotStarted`]. A `join` that returns `Ok` always has the result of its run.
 ///
 /// # Examples
 ///
@@ -264,8 +260,8 @@ impl<T> StaticDeferred<T> {
 
     /// Calls `f` with the result if the run has finished, without moving it out.
     ///
-    /// `f` runs inside a critical section, so keep it short, and don't use this
-    /// `StaticDeferred` from `f`: that panics because it is already borrowed.
+    /// Keep `f` short: on most embedded targets, interrupts are blocked while it runs. Don't
+    /// use the same `StaticDeferred` inside `f`; that panics.
     pub fn with_result<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
         self.with(|shared| match &shared.phase {
             Phase::Done(value) => Some(f(value)),
@@ -331,9 +327,9 @@ impl<T> StaticDeferred<T> {
 
     /// Stops the run in progress and resets to [`State::NotStarted`], so a new run can begin.
     ///
-    /// The task stops the next time its executor runs it, so it may still hold its executor
-    /// resources, such as an embassy task pool slot, when this returns. Use
-    /// [`cancel_and_wait`](Self::cancel_and_wait) to wait until it has stopped.
+    /// The task may still be using its executor resources, such as an embassy task pool
+    /// slot, when this returns. To start a new run right away in a full task pool, use
+    /// [`cancel_and_wait`](Self::cancel_and_wait) instead.
     /// Returns `false` and does nothing if no run is in progress.
     pub fn cancel(&self) -> bool {
         let (cancelled, task, waiter) = self.with(|shared| {
@@ -358,6 +354,16 @@ impl<T> StaticDeferred<T> {
     /// neither run nor dropped, for example passed to [`mem::forget`], makes this wait
     /// forever.
     /// Returns `true` if a run was in progress.
+    ///
+    /// ```rust,ignore
+    /// // The sensor hung: stop it, then start again once its task is gone.
+    /// SENSOR.cancel_and_wait().await;
+    /// if let Ok(ticket) = SENSOR.begin() {
+    ///     if let Ok(token) = sensor_task(ticket) {
+    ///         spawner.spawn(token);
+    ///     }
+    /// }
+    /// ```
     pub async fn cancel_and_wait(&self) -> bool {
         let cancelled = self.cancel();
         let mut waiter_id = None;
@@ -413,13 +419,12 @@ impl<T> core::fmt::Debug for Ticket<'_, T> {
 }
 
 impl<'a, T> Ticket<'a, T> {
-    /// Runs `future` and stores its output in the [`StaticDeferred`].
+    /// Runs `future` and makes its output the result of the [`StaticDeferred`].
     ///
-    /// Returns early, without storing anything, if the run is cancelled. If this future is
-    /// dropped after its first poll but before it finishes, the `StaticDeferred` reports
-    /// [`State::Cancelled`]. Dropped before its first poll, it still holds the ticket, so it
-    /// counts as a ticket dropped without running: the state goes back to
-    /// [`State::NotStarted`].
+    /// Returns early, without a result, if the run is cancelled. If the task is dropped while
+    /// the job is running, the `StaticDeferred` reports [`State::Cancelled`]. If it is dropped
+    /// before the job starts, it counts as a ticket dropped without running: the state goes
+    /// back to [`State::NotStarted`].
     pub async fn run<F>(self, future: F)
     where
         F: Future<Output = T>,

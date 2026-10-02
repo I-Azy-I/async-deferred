@@ -1,13 +1,12 @@
 /// Declares a [`LocalSpawner`](crate::LocalSpawner) for the embassy executor.
 ///
-/// Embassy only runs tasks declared with `#[embassy_executor::task]`, so this macro declares
-/// one with room for `pool_size` tasks at once, and a spawner type that runs every
-/// [`Deferred`](crate::Deferred) task through it. Starting a task while `pool_size` tasks
-/// are running returns a [`SpawnError`](crate::SpawnError).
+/// The spawner can run up to `pool_size` [`Deferred`](crate::Deferred) tasks at once.
+/// Starting a task while `pool_size` tasks are running returns a
+/// [`SpawnError`](crate::SpawnError).
 ///
-/// A task cancelled with [`cancel`](crate::Deferred::cancel) frees its slot the next time
-/// the executor runs it. To start a new task right away in a full pool, use
-/// [`cancel_and_wait`](crate::Deferred::cancel_and_wait).
+/// To stop a task and start a new one right away in a full pool, use
+/// [`cancel_and_wait`](crate::Deferred::cancel_and_wait) rather than
+/// [`cancel`](crate::Deferred::cancel).
 ///
 /// Needs `embassy-executor` 0.10 and a heap allocator, such as `esp-alloc` or
 /// `embedded-alloc`.

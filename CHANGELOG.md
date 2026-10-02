@@ -45,8 +45,7 @@
 - `has_callback_panicked` and `is_cancelled`, so every `State` has an `is_*` helper.
 - `state` and the `is_*` helpers take `&self` instead of `&mut self`, so the status can be
   checked through a shared reference, for example from a `&self` method or another thread.
-  The task sets a status flag after sending its result. `try_get`, `take`, `join` and
-  `panic_message` still take `&mut self`.
+  `try_get`, `take`, `join` and `panic_message` still take `&mut self`.
 - `LocalSpawner` for `tokio::task::LocalSet` and `smol::LocalExecutor`.
 - `Spawner` for any `smol::Executor<'a>`, not only `Executor<'static>`.
 
