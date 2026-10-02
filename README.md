@@ -134,7 +134,7 @@ Tasks are started through a spawner, which hands them to an async runtime.
 To use another runtime without pulling in Tokio:
 
 ```toml
-async-deferred = { version = "0.3", default-features = false, features = ["smol"] }
+async-deferred = { version = "0.4", default-features = false, features = ["smol"] }
 ```
 
 ### smol
@@ -178,7 +178,7 @@ and use the `*_local_on` methods.
 ### Embassy (`no_std`)
 
 ```toml
-async-deferred = { version = "0.3", default-features = false }
+async-deferred = { version = "0.4", default-features = false }
 ```
 
 `embassy_spawner!` declares a spawner for embassy in one line. You also need a heap allocator,

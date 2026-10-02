@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.4.0
+
+### Breaking changes
+
+- `Spawner::spawn` and `LocalSpawner::spawn_local` return `Result<(), SpawnError>`, so a
+  runtime can refuse a task, for example when its task pool is full. Custom spawners return
+  `Ok(())` after handing the task to their runtime.
+- `start_on`, `start_with_callback_on`, `start_local_on` and
+  `start_with_callback_local_on` return `Result<Deferred<T>, SpawnError>`.
+- `begin`, `begin_on`, `begin_local_on` and their callback variants return
+  `Result<(), BeginError>` instead of `bool`: `BeginError::AlreadyStarted` replaces `false`,
+  and `BeginError::Spawn` reports a refused task.
+- `embassy_spawner!` spawners return a `SpawnError` when all `pool_size` tasks are running,
+  instead of panicking.
+
+`start` and `start_with_callback` (Tokio) still return `Deferred<T>` directly: Tokio never
+refuses a task.
+
+### Added
+
+- `cancel_and_wait` cancels the task and waits until it has stopped, so the runtime has
+  freed its resources (such as an embassy task pool slot) when it returns.
+
+### Fixed
+
+- Restarting right after `cancel` in a full embassy task pool panicked, because the
+  cancelled task keeps its slot until the executor runs it again. Use `cancel_and_wait`
+  before restarting, or handle the `SpawnError` that `begin` now returns.
+
 ## 0.3.0
 
 ### Breaking changes
