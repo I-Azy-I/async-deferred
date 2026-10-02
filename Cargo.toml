@@ -26,6 +26,7 @@ smol = { version = "2", optional = true }
 
 [dev-dependencies]
 futures-executor = "0.3"
+proptest = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tokio-test = "0.4"
 
