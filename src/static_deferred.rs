@@ -64,6 +64,15 @@ struct Shared<T> {
     task: Option<Waker>,
     /// Whoever waits in `join` or `cancel_and_wait`.
     waiter: Option<Waker>,
+    /// The run a `join` waits for, and whether its result was taken by someone else.
+    /// Only that run's outcome is kept, so later runs can't change what the `join` reports.
+    awaited: Option<Awaited>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Awaited {
+    run: u32,
+    taken: bool,
 }
 
 enum Phase<T> {
@@ -104,6 +113,7 @@ impl<T> StaticDeferred<T> {
                 live: 0,
                 task: None,
                 waiter: None,
+                awaited: None,
             })),
         }
     }
@@ -172,7 +182,14 @@ impl<T> StaticDeferred<T> {
     pub fn take(&self) -> Option<T> {
         self.with(
             |shared| match mem::replace(&mut shared.phase, Phase::NotStarted) {
-                Phase::Done(value) => Some(value),
+                Phase::Done(value) => {
+                    if let Some(awaited) = &mut shared.awaited {
+                        if awaited.run == shared.run {
+                            awaited.taken = true;
+                        }
+                    }
+                    Some(value)
+                }
                 other => {
                     shared.phase = other;
                     None
@@ -203,12 +220,28 @@ impl<T> StaticDeferred<T> {
         let mut waiting_for = None;
         poll_fn(|cx| {
             let (poll, to_wake) = self.with(|shared| match shared.phase {
-                // `cancel` moves to a new run number, so a change means it was cancelled.
+                // The awaited run ended and a new run number was given out since.
                 _ if waiting_for.map_or(false, |run| run != shared.run) => {
-                    (Poll::Ready(Err(Error::Cancelled)), None)
+                    let taken = shared.awaited
+                        == Some(Awaited {
+                            run: waiting_for.unwrap_or_default(),
+                            taken: true,
+                        });
+                    let error = if taken {
+                        Error::NotStarted
+                    } else {
+                        Error::Cancelled
+                    };
+                    (Poll::Ready(Err(error)), None)
                 }
                 Phase::Pending => {
                     waiting_for = Some(shared.run);
+                    if shared.awaited.map(|a| a.run) != Some(shared.run) {
+                        shared.awaited = Some(Awaited {
+                            run: shared.run,
+                            taken: false,
+                        });
+                    }
                     (Poll::Pending, register(&mut shared.waiter, cx.waker()))
                 }
                 Phase::NotStarted => (Poll::Ready(Err(Error::NotStarted)), None),

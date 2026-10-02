@@ -452,3 +452,65 @@ fn join_after_the_result_was_taken_elsewhere() {
         Poll::Ready(Err(Error::NotStarted))
     );
 }
+
+/// Starts a run that waits for `rx`, and a `join` waiting for it.
+fn waiting_join_setup<'a>(
+    deferred: &'a StaticDeferred<u32>,
+    executor: &mut Executor<'a>,
+    rx: oneshot::Receiver<u32>,
+) {
+    executor
+        .spawn(deferred.begin().unwrap(), async { rx.await.unwrap() })
+        .unwrap();
+    executor.run();
+}
+
+/// A result taken by another task, followed by a new run, is not a cancellation.
+#[test]
+fn join_after_the_result_was_taken_and_a_new_run_began() {
+    let deferred = StaticDeferred::<u32>::new();
+    let mut executor = Executor::new(2);
+    let mut cx = Context::from_waker(noop_waker_ref());
+    let (tx, rx) = oneshot::channel();
+    waiting_join_setup(&deferred, &mut executor, rx);
+
+    let mut join = std::pin::pin!(deferred.join());
+    assert!(join.as_mut().poll(&mut cx).is_pending());
+    tx.send(7).unwrap();
+    executor.run();
+
+    // Another task takes the result and starts the next run before `join` is polled again.
+    assert_eq!(deferred.take(), Some(7));
+    executor
+        .spawn(deferred.begin().unwrap(), async { 8 })
+        .unwrap();
+    assert_eq!(
+        join.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::NotStarted))
+    );
+}
+
+/// Later runs ending, even by `cancel`, don't change what happened to the awaited run.
+#[test]
+fn join_after_take_then_a_later_run_is_cancelled() {
+    let deferred = StaticDeferred::<u32>::new();
+    let mut executor = Executor::new(2);
+    let mut cx = Context::from_waker(noop_waker_ref());
+    let (tx, rx) = oneshot::channel();
+    waiting_join_setup(&deferred, &mut executor, rx);
+
+    let mut join = std::pin::pin!(deferred.join());
+    assert!(join.as_mut().poll(&mut cx).is_pending());
+    tx.send(7).unwrap();
+    executor.run();
+
+    assert_eq!(deferred.take(), Some(7));
+    executor
+        .spawn(deferred.begin().unwrap(), std::future::pending())
+        .unwrap();
+    assert!(deferred.cancel());
+    assert_eq!(
+        join.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::NotStarted))
+    );
+}
